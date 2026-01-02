@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LeadGen</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main>
+    <h1>LeadGen – Austin Emergency Plumbing</h1>
+    <p>We connect urgent plumbing needs with vetted local experts.</p>
+    <form id="lead-form">
+      <input type="text" name="name" placeholder="Full name" required />
+      <input type="email" name="email" placeholder="Email" required />
+      <input type="tel" name="phone" placeholder="Phone" required />
+      <input type="text" name="zip" placeholder="ZIP" required />
+      <textarea name="message" placeholder="Tell us what you need"></textarea>
+      <button type="submit">Submit Lead</button>
+    </form>
+    <p id="response-message" role="status"></p>
+  </main>
+  <script src="form.js"></script>
+</body>
+</html>
