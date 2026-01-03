@@ -25,6 +25,8 @@ ENV/
 .env
 .env.local
 .env.*.local
+**/.env
+cli/.env
 
 # Database
 *.db
