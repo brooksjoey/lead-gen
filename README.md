@@ -17,6 +17,55 @@ LeadGen is an event-driven lead distribution platform starter kit. It couples mo
 3. CLI health check: `curl http://localhost/health`.
 4. Submit leads via `POST http://localhost/api/leads` with JSON payload (see API docs).
 
+## Database: Apply Migrations
+
+The database schema is defined in `api/db/migrations/` and implements the complete Technical Architecture Specification schema.
+
+### Fresh Database Setup
+
+To create a fresh database and apply all migrations:
+
+```bash
+docker compose down -v
+docker compose up -d postgres
+```
+
+Migrations are automatically applied when the Postgres container starts if they are mounted to `/docker-entrypoint-initdb.d/`.
+
+### Manual Migration Application
+
+If migrations need to be applied manually:
+
+```bash
+# Apply migrations in order
+docker compose exec -T postgres psql -U leadgen -d leadgen -f /path/to/002_spec_schema_enums.sql
+docker compose exec -T postgres psql -U leadgen -d leadgen -f /path/to/003_spec_schema_core_tables.sql
+docker compose exec -T postgres psql -U leadgen -d leadgen -f /path/to/004_spec_schema_buyers.sql
+docker compose exec -T postgres psql -U leadgen -d leadgen -f /path/to/005_spec_schema_leads.sql
+docker compose exec -T postgres psql -U leadgen -d leadgen -f /path/to/006_spec_schema_invoices_audit.sql
+docker compose exec -T postgres psql -U leadgen -d leadgen -f /path/to/007_spec_schema_indexes.sql
+```
+
+### Verify Schema
+
+To verify the schema was applied correctly:
+
+```bash
+# List all tables
+docker compose exec -T postgres psql -U leadgen -d leadgen -c "\dt"
+
+# Inspect leads table structure
+docker compose exec -T postgres psql -U leadgen -d leadgen -c "\d+ leads"
+
+# Inspect sources table structure
+docker compose exec -T postgres psql -U leadgen -d leadgen -c "\d+ sources"
+
+# Inspect offers table structure
+docker compose exec -T postgres psql -U leadgen -d leadgen -c "\d+ offers"
+```
+
+All migrations are idempotent and can be safely re-run multiple times.
+
 ## Testing
 
 - Run `pip install -r api/requirements.txt` then `python -m pytest` for FastAPI unit tests.

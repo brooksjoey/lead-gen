@@ -8,7 +8,7 @@ from api.routes.ingest import router as ingest_router
 
 configure_structlog()
 
-app = FastAPI(title="LeadGen API", version="0.2.0")
+app = FastAPI(title="LeadGen API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,12 +22,14 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     get_structlog_logger().info("health.check", status="healthy")
+    from datetime import datetime
     return {
         "status": "healthy",
         "service": "leadgen_api",
         "environment": settings.environment,
-        "version": "0.2.0",
-        "database": "connected" if settings.database_url else "unknown"
+        "version": "1.0.0",
+        "database": "connected" if settings.database_url else "unknown",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
 

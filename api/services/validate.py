@@ -1,13 +1,22 @@
-from api.schemas.lead import LeadIn
+from __future__ import annotations
 
-VALID_ZIP_LENGTH = 5
+from sqlalchemy.ext.asyncio import AsyncSession
 
-async def validate_lead(payload: LeadIn) -> None:
-    if not payload.name.strip():
-        raise ValueError('Name is required')
-    if not payload.phone.strip():
-        raise ValueError('Phone number is required')
-    if len(payload.zip.strip()) != VALID_ZIP_LENGTH:
-        raise ValueError('ZIP code must be five digits')
-    if not payload.consent:
-        raise ValueError('Consent is required to process leads')
+from api.services.validation_engine import ValidationError, execute_validation
+
+
+async def validate_lead(
+    *, session: AsyncSession, lead_id: int
+) -> None:
+    """
+    Validate a lead using policy-driven validation and duplicate detection.
+    This function executes the validation pipeline and updates the lead status.
+    """
+    result = await execute_validation(session=session, lead_id=lead_id)
+    
+    if not result.is_valid:
+        raise ValidationError(
+            code="validation_failed",
+            message="Lead did not pass validation",
+            reason=result.reason,
+        )
