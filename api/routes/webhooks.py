@@ -15,7 +15,7 @@ from api.core.exceptions import AuthenticationError, ValidationError
 from api.core.logging import get_structlog_logger
 from api.services.auth import get_current_user, require_role
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -126,7 +126,7 @@ async def process_webhook_delivery(
     """Process webhook delivery in background."""
     import aiohttp
     
-    logger = get_structlog_logger(__name__)
+    logger = get_structlog_logger()
     
     try:
         # Prepare payload
@@ -461,7 +461,7 @@ async def process_webhook_event(
     headers: Dict,
 ):
     """Process received webhook event."""
-    logger = get_structlog_logger(__name__)
+    logger = get_structlog_logger()
     
     try:
         # Store event for auditing
@@ -495,7 +495,7 @@ async def store_webhook_event(event: WebhookEvent, headers: Dict):
     """Store webhook event for auditing."""
     # In production, store in database
     # For now, just log
-    logger = get_structlog_logger(__name__)
+    logger = get_structlog_logger()
     
     logger.info(
         "webhook.event_stored",
@@ -509,19 +509,19 @@ async def store_webhook_event(event: WebhookEvent, headers: Dict):
 async def process_lead_delivered(data: Dict):
     """Process lead delivered event."""
     # Update lead status, send notifications, etc.
-    logger = get_structlog_logger(__name__)
+    logger = get_structlog_logger()
     logger.info("webhook.lead_delivered_processed", lead_id=data.get("lead_id"))
 
 
 async def process_lead_failed(data: Dict):
     """Process lead failed event."""
     # Trigger alerts, update dashboards, etc.
-    logger = get_structlog_logger(__name__)
+    logger = get_structlog_logger()
     logger.warning("webhook.lead_failed_processed", lead_id=data.get("lead_id"))
 
 
 async def process_system_alert(data: Dict):
     """Process system alert event."""
     # Send notifications, update monitoring, etc.
-    logger = get_structlog_logger(__name__)
+    logger = get_structlog_logger()
     logger.error("webhook.system_alert_processed", alert=data.get("alert"))

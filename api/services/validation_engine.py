@@ -14,9 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from redis.asyncio import Redis
 
 from .normalization import normalize_contact, NormalizedContact
-from .logging import get_logger
+from api.core.logging import get_structlog_logger
 
-logger = get_logger(__name__)
+logger = get_structlog_logger()
 
 class ValidationRuleType(Enum):
     REQUIRED_FIELD = "required_field"
@@ -772,3 +772,92 @@ class ValidationEngine:
 
 # Global instance
 validation_engine = ValidationEngine()
+
+
+# Additional classes and functions for test compatibility
+@dataclass
+class ValidationPolicy:
+    """Policy object for validation tests."""
+    id: int
+    name: str
+    version: int
+    rules: Dict[str, Any]
+    is_active: bool = True
+
+
+@dataclass
+class DuplicateDetectionPolicy:
+    """Duplicate detection policy configuration."""
+    enabled: bool
+    window_hours: int
+    scope: str
+    keys: List[str]
+    match_mode: str
+    exclude_statuses: List[str]
+    include_sources: str
+    action: str
+    reason_code: str
+    min_fields: List[str]
+    normalize: Dict[str, str]
+
+
+def parse_duplicate_detection_policy(rules: Dict[str, Any]) -> Optional[DuplicateDetectionPolicy]:
+    """Parse duplicate detection policy from rules dict. Returns None if disabled or missing."""
+    dup_config = rules.get("duplicate_detection")
+    if not dup_config or not dup_config.get("enabled", False):
+        return None
+    
+    return DuplicateDetectionPolicy(
+        enabled=True,
+        window_hours=dup_config.get("window_hours", 24),
+        scope=dup_config.get("scope", "offer"),
+        keys=dup_config.get("keys", ["phone", "email"]),
+        match_mode=dup_config.get("match_mode", "any"),
+        exclude_statuses=dup_config.get("exclude_statuses", ["rejected"]),
+        include_sources=dup_config.get("include_sources", "any"),
+        action=dup_config.get("action", "reject"),
+        reason_code=dup_config.get("reason_code", "duplicate_recent"),
+        min_fields=dup_config.get("min_fields", ["phone"]),
+        normalize=dup_config.get("normalize", {})
+    )
+
+
+async def validate_lead_fields(policy: ValidationPolicy, lead_data: Dict[str, Any]) -> Optional[str]:
+    """Validate lead fields against policy. Returns error message or None if valid."""
+    # Check required fields
+    required_fields = policy.rules.get("required_fields", [])
+    for field in required_fields:
+        value = lead_data.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return f"Required field '{field}' is missing or empty"
+    
+    # Check allowed postal codes
+    allowed_postal_codes = policy.rules.get("allowed_postal_codes", [])
+    if allowed_postal_codes and lead_data.get("postal_code"):
+        if lead_data["postal_code"] not in allowed_postal_codes:
+            return f"Postal code '{lead_data['postal_code']}' is not in allowed list"
+    
+    # Check allowed cities
+    allowed_cities = policy.rules.get("allowed_cities", [])
+    if allowed_cities and lead_data.get("city"):
+        if lead_data["city"] not in allowed_cities:
+            return f"City '{lead_data['city']}' is not in allowed list"
+    
+    return None
+
+
+async def load_validation_policy(session: AsyncSession, offer_id: int) -> ValidationPolicy:
+    """Load validation policy for an offer. Returns ValidationPolicy object."""
+    policy_dict = await validation_engine._load_validation_policy(session, offer_id)
+    return ValidationPolicy(
+        id=policy_dict["id"],
+        name=policy_dict["name"],
+        version=policy_dict["version"],
+        rules=policy_dict["rules"],
+        is_active=policy_dict["is_active"]
+    )
+
+
+async def execute_validation(session: AsyncSession, lead_id: int) -> ValidationResult:
+    """Execute validation for a lead. Wrapper around ValidationEngine.validate_lead()."""
+    return await validation_engine.validate_lead(session, lead_id)

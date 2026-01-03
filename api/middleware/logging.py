@@ -12,7 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from api.core.config import settings
 from api.core.logging import get_structlog_logger, set_request_id
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):

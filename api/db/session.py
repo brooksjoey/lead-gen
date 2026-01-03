@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional
+from datetime import datetime
+from typing import Any, AsyncGenerator, Optional
 
 from sqlalchemy import event, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -19,7 +20,7 @@ from api.core.config import settings
 from api.core.exceptions import DatabaseError
 from api.core.logging import get_structlog_logger
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 # Global engine instance
 engine: Optional[AsyncEngine] = None

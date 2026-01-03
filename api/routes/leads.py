@@ -20,7 +20,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,10 +34,10 @@ from api.core.exceptions import (
     ValidationError,
 )
 from api.core.logging import get_structlog_logger
-from api.db.models.lead import Lead, LeadDelivery, LeadNote
+from api.models.lead import Lead
 from api.db.session import get_session, transaction_session
 from api.schemas.common import PaginatedResponse, PaginationParams
-from api.services.auth import get_current_user, require_role
+from api.middleware.auth import get_current_user, require_role
 from api.services.delivery_queue import delivery_queue
 from api.services.validation import (
     deduplicate_leads,
@@ -49,7 +49,7 @@ from api.services.validation import (
 from api.utils.csv_parser import parse_csv_leads
 from api.utils.excel_parser import parse_excel_leads
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 router = APIRouter(prefix="/leads", tags=["leads"])
 
@@ -106,7 +106,7 @@ class LeadUpdate(BaseModel):
     message: Optional[str] = Field(None, max_length=2000)
     status: Optional[str] = Field(
         None,
-        pattern="^(new|validated|processing|delivered|failed|duplicate|rejected)$"
+        pattern="^(received|validated|delivered|accepted|rejected)$"
     )
     metadata: Optional[Dict[str, Any]] = None
     
@@ -130,13 +130,23 @@ class LeadResponse(LeadBase):
     market_id: int
     vertical_id: int
     status: str
-    hash: str
+    hash: Optional[str] = None
     validation_errors: Optional[List[str]] = None
     delivered_at: Optional[datetime] = None
     delivery_attempts: int = 0
     delivery_result: Optional[Dict[str, Any]] = None
     created_at: datetime
-    updated_at: datetime
+    updated_at: Optional[datetime] = None
+    
+    @model_validator(mode="before")
+    @classmethod
+    def map_zip_to_postal_code(cls, data):
+        """Map zip field to postal_code for API compatibility."""
+        if isinstance(data, dict):
+            # If postal_code is missing but zip exists, use zip
+            if "postal_code" not in data and "zip" in data:
+                data["postal_code"] = data["zip"]
+        return data
     
     class Config:
         from_attributes = True
@@ -198,10 +208,13 @@ class LeadFilterParams(BaseModel):
 # Utility Functions
 def generate_lead_hash(lead_data: Dict[str, Any]) -> str:
     """Generate a unique hash for lead deduplication."""
+    # Handle both postal_code and zip fields
+    postal_code = lead_data.get("postal_code") or lead_data.get("zip", "")
+    
     hash_fields = [
         str(lead_data.get("email", "")).lower().strip(),
         str(lead_data.get("phone", "")).strip(),
-        str(lead_data.get("postal_code", "")).strip(),
+        str(postal_code).strip(),
         str(lead_data.get("buyer_id", "")),
         str(lead_data.get("offer_id", "")),
     ]
@@ -318,22 +331,43 @@ async def validate_business_rules(
     return errors
 
 
+# Note: Delivery records are stored in Lead.delivery_result JSONB field
+# This function is kept for API compatibility but uses the Lead model
 async def create_lead_delivery(
     session: AsyncSession,
     lead_id: int,
     delivery_data: Dict[str, Any],
-) -> LeadDelivery:
-    """Create lead delivery record."""
-    delivery = LeadDelivery(
-        lead_id=lead_id,
-        **delivery_data,
-    )
+) -> Dict[str, Any]:
+    """Create lead delivery record (stored in Lead.delivery_result)."""
+    from sqlalchemy import select
     
-    session.add(delivery)
+    stmt = select(Lead).where(Lead.id == lead_id)
+    result = await session.execute(stmt)
+    lead = result.scalar_one_or_none()
+    
+    if not lead:
+        raise NotFoundError(
+            message="Lead not found",
+            details={"lead_id": lead_id},
+        )
+    
+    # Update delivery result
+    if lead.delivery_result:
+        delivery_history = lead.delivery_result.get("attempts", [])
+    else:
+        delivery_history = []
+    
+    delivery_history.append(delivery_data)
+    lead.delivery_result = {
+        "attempts": delivery_history,
+        "last_updated": datetime.utcnow().isoformat(),
+    }
+    lead.delivery_attempts = len(delivery_history)
+    
     await session.commit()
-    await session.refresh(delivery)
+    await session.refresh(lead)
     
-    return delivery
+    return delivery_data
 
 
 # Routes
@@ -346,7 +380,7 @@ async def list_leads(
     offer_id: Optional[int] = Query(None),
     status: Optional[str] = Query(
         None,
-        pattern="^(new|validated|processing|delivered|failed|duplicate|rejected)$"
+        pattern="^(received|validated|delivered|accepted|rejected)$"
     ),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
@@ -497,11 +531,15 @@ async def create_lead(
             details={"errors": business_errors},
         )
     
+    # Map postal_code to zip for model compatibility
+    if "postal_code" in lead_dict:
+        lead_dict["zip"] = lead_dict.pop("postal_code")
+    
     # Create lead
     lead = Lead(
         **lead_dict,
         hash=hash_value,
-        status="new",
+        status="received",  # Use "received" instead of "new" to match enum
         created_by=current_user.get("id"),
         ip_address=current_user.get("ip_address"),
         user_agent=current_user.get("user_agent"),
@@ -579,8 +617,18 @@ async def update_lead(
     update_data = lead_data.model_dump(exclude_unset=True)
     
     # Regenerate hash if contact info changed
-    if any(field in update_data for field in ["email", "phone", "postal_code"]):
-        lead_dict = lead.to_dict()
+    if any(field in update_data for field in ["email", "phone", "postal_code", "zip"]):
+        # Map postal_code to zip if needed
+        if "postal_code" in update_data:
+            update_data["zip"] = update_data.pop("postal_code")
+        
+        lead_dict = {
+            "email": lead.email,
+            "phone": lead.phone,
+            "postal_code": lead.zip or lead.postal_code,
+            "buyer_id": lead.buyer_id,
+            "offer_id": lead.offer_id,
+        }
         lead_dict.update(update_data)
         update_data["hash"] = generate_lead_hash(lead_dict)
     
@@ -658,7 +706,7 @@ async def deliver_lead(
     lead = await get_lead_or_404(lead_id, session, current_user)
     
     # Check lead status
-    if lead.status not in ["new", "validated", "failed"]:
+    if lead.status not in ["received", "validated", "rejected"]:
         raise BusinessRuleError(
             message=f"Cannot deliver lead with status: {lead.status}",
             details={"lead_id": lead_id, "status": lead.status},
@@ -695,15 +743,24 @@ async def get_lead_deliveries(
     """Get delivery history for a lead."""
     lead = await get_lead_or_404(lead_id, session, current_user)
     
-    from sqlalchemy import select
-    
-    stmt = select(LeadDelivery).where(
-        LeadDelivery.lead_id == lead_id,
-        LeadDelivery.deleted_at.is_(None),
-    ).order_by(LeadDelivery.created_at.desc())
-    
-    result = await session.execute(stmt)
-    deliveries = result.scalars().all()
+    # Extract delivery attempts from delivery_result JSONB field
+    deliveries = []
+    if lead.delivery_result and isinstance(lead.delivery_result, dict):
+        attempts = lead.delivery_result.get("attempts", [])
+        for idx, attempt in enumerate(attempts, 1):
+            deliveries.append({
+                "id": idx,
+                "lead_id": lead_id,
+                "buyer_id": lead.buyer_id or 0,
+                "channel": attempt.get("channel", "unknown"),
+                "status": attempt.get("status", "unknown"),
+                "attempt_number": attempt.get("attempt_number", idx),
+                "response_code": attempt.get("response_code"),
+                "response_time_ms": attempt.get("response_time_ms"),
+                "error_message": attempt.get("error_message"),
+                "metadata": attempt.get("metadata", {}),
+                "created_at": attempt.get("timestamp") or lead.created_at,
+            })
     
     logger.info(
         "lead.deliveries.list",
@@ -716,6 +773,8 @@ async def get_lead_deliveries(
 
 
 # Notes Routes
+# Note: Lead notes functionality is not implemented in the current schema
+# These endpoints return empty lists/errors for API compatibility
 @router.get("/{lead_id}/notes", response_model=List[LeadNoteResponse])
 async def get_lead_notes(
     lead_id: int,
@@ -726,36 +785,16 @@ async def get_lead_notes(
     """Get notes for a lead."""
     lead = await get_lead_or_404(lead_id, session, current_user)
     
-    from sqlalchemy import select
-    
-    stmt = select(LeadNote).where(
-        LeadNote.lead_id == lead_id,
-        LeadNote.deleted_at.is_(None),
-    )
-    
-    if not include_internal:
-        stmt = stmt.where(LeadNote.is_internal == False)
-    
-    stmt = stmt.order_by(LeadNote.created_at.desc())
-    
-    result = await session.execute(stmt)
-    notes = result.scalars().all()
-    
-    # Add creator names
-    for note in notes:
-        if note.created_by:
-            # In production, you'd join with users table
-            note.created_by_name = f"User {note.created_by}"
-    
+    # Notes table not implemented - return empty list
     logger.info(
         "lead.notes.list",
         lead_id=lead_id,
         user_id=current_user.get("id"),
-        count=len(notes),
+        count=0,
         include_internal=include_internal,
     )
     
-    return notes
+    return []
 
 
 @router.post("/{lead_id}/notes", response_model=LeadNoteResponse, status_code=status.HTTP_201_CREATED)
@@ -770,36 +809,11 @@ async def create_lead_note(
     
     lead = await get_lead_or_404(lead_id, session, current_user)
     
-    # Create note
-    note = LeadNote(
-        lead_id=lead_id,
-        **note_data.model_dump(),
-        created_by=current_user.get("id"),
+    # Notes table not implemented - return error
+    raise BusinessRuleError(
+        message="Lead notes functionality not yet implemented",
+        details={"lead_id": lead_id},
     )
-    
-    session.add(note)
-    
-    try:
-        await session.commit()
-        await session.refresh(note)
-        
-        # Add creator name
-        note.created_by_name = f"User {current_user.get('id')}"
-        
-        logger.info(
-            "lead.note.created",
-            lead_id=lead_id,
-            note_id=note.id,
-            user_id=current_user.get("id"),
-            is_internal=note.is_internal,
-        )
-        
-        return note
-        
-    except Exception as e:
-        await session.rollback()
-        logger.error("lead.note.creation_failed", error=str(e))
-        raise
 
 
 # Bulk Operations
@@ -882,6 +896,10 @@ async def create_bulk_leads(
                 "vertical_id": vertical_id,
             })
             
+            # Map postal_code to zip for model compatibility
+            if "postal_code" in lead_row:
+                lead_row["zip"] = lead_row.pop("postal_code")
+            
             # Validate lead data
             validation_errors = await validate_lead_data(session, lead_row)
             if validation_errors:
@@ -892,8 +910,11 @@ async def create_bulk_leads(
                 })
                 continue
             
-            # Generate hash
-            hash_value = generate_lead_hash(lead_row)
+            # Generate hash (use postal_code if available, otherwise zip)
+            hash_data = lead_row.copy()
+            if "zip" in hash_data and "postal_code" not in hash_data:
+                hash_data["postal_code"] = hash_data["zip"]
+            hash_value = generate_lead_hash(hash_data)
             
             # Check for duplicates
             duplicate = await check_duplicate_lead(session, lead_row, hash_value)
@@ -906,7 +927,7 @@ async def create_bulk_leads(
             lead = Lead(
                 **lead_row,
                 hash=hash_value,
-                status="new",
+                status="received",  # Use "received" instead of "new" to match enum
                 created_by=current_user.get("id"),
             )
             
@@ -1009,7 +1030,7 @@ async def export_leads_csv(
             lead.name,
             lead.email,
             lead.phone,
-            lead.postal_code,
+            lead.zip or lead.postal_code or "",
             lead.city or "",
             lead.state or "",
             lead.country,
@@ -1051,7 +1072,7 @@ async def process_lead_delivery(
     """Background task to process lead delivery."""
     from api.core.logging import get_structlog_logger
     
-    logger = get_structlog_logger(__name__)
+    logger = get_structlog_logger()
     
     try:
         # Get database session
@@ -1071,8 +1092,8 @@ async def process_lead_delivery(
                 logger.error("lead.delivery.lead_not_found", lead_id=lead_id)
                 return
             
-            # Update status to processing
-            lead.status = "processing"
+            # Update status to validated (processing not in enum, use validated)
+            lead.status = "validated"
             lead.updated_by = user_id
             
             await session.commit()
@@ -1099,7 +1120,7 @@ async def process_lead_delivery(
             success = await delivery_queue.enqueue_delivery(lead_id, priority=1)
             
             if not success:
-                lead.status = "failed"
+                lead.status = "rejected"  # Use "rejected" instead of "failed" to match enum
                 lead.updated_by = user_id
                 await session.commit()
                 

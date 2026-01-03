@@ -17,7 +17,7 @@ from api.core.config import settings
 from api.core.logging import get_structlog_logger
 from api.db.session import get_session
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 router = APIRouter(tags=["health"])
 

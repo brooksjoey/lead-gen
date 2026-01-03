@@ -4,9 +4,16 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# Copy API requirements (workers may need API modules)
+COPY api/requirements.txt ./api_requirements.txt
 COPY workers/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r api_requirements.txt -r requirements.txt
 
+# Copy both api and workers directories
+COPY api ./api
 COPY workers ./workers
+
+# Set Python path
+ENV PYTHONPATH=/app
 
 CMD ["python", "workers/notify.py"]

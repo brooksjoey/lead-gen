@@ -4,7 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.main import app
-from api.services.classification import resolve_classification
+from api.services.classification_resolver import resolve_classification
 
 
 @pytest.fixture

@@ -18,7 +18,7 @@ from api.core.config import settings
 from api.core.exceptions import DeliveryError
 from api.core.logging import get_structlog_logger
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 
 class DeliveryStatus(Enum):
@@ -706,16 +706,17 @@ class DeliveryQueue:
         return fallback_map.get(primary, [])
     
     async def _update_lead_delivery(self, session, lead_id: int, result: DeliveryResult):
-        """Update lead with delivery result."""
+        """Update lead with delivery result and trigger billing if successful."""
         from sqlalchemy import text
         
         if result.success:
             status = "delivered"
             delivered_at = result.last_attempt or datetime.utcnow()
         else:
-            status = "delivery_failed"
+            status = "rejected"  # Use "rejected" instead of "delivery_failed" to match enum
             delivered_at = None
         
+        # Use idempotency guard: only update if status is 'validated' (prevents double-delivery)
         query = text("""
             UPDATE leads 
             SET 
@@ -725,9 +726,11 @@ class DeliveryQueue:
                 delivery_attempts = :attempts,
                 delivery_result = :result_json
             WHERE id = :lead_id
+              AND status = 'validated'
+            RETURNING buyer_id
         """)
         
-        await session.execute(query, {
+        result_exec = await session.execute(query, {
             "lead_id": lead_id,
             "status": status,
             "delivered_at": delivered_at,
@@ -735,7 +738,34 @@ class DeliveryQueue:
             "result_json": json.dumps(result.to_dict()),
         })
         
+        row = result_exec.fetchone()
         await session.commit()
+        
+        # If delivery succeeded and lead was updated, bill the buyer
+        # Use a new session for billing to ensure transaction isolation
+        if result.success and row and row[0]:
+            buyer_id = row[0]
+            try:
+                from api.services.billing import bill_lead
+                from api.db.session import get_session
+                
+                # Get a new session for billing
+                async with get_session() as billing_session:
+                    billing_success = await bill_lead(billing_session, lead_id, buyer_id)
+                    if not billing_success:
+                        logger.warning(
+                            "delivery.billing_failed",
+                            lead_id=lead_id,
+                            buyer_id=buyer_id,
+                        )
+            except Exception as e:
+                # Don't fail delivery if billing fails - log and continue
+                logger.error(
+                    "delivery.billing_error",
+                    lead_id=lead_id,
+                    buyer_id=buyer_id,
+                    error=str(e),
+                )
     
     async def _complete_job(self, job_id: str, result: DeliveryResult):
         """Mark job as completed successfully."""

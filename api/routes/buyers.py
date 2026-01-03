@@ -21,14 +21,14 @@ from api.core.exceptions import (
     ValidationError,
 )
 from api.core.logging import get_structlog_logger
-from api.db.models.buyer import Buyer, BuyerOffer, BuyerWebhook
-from api.db.models.offer import Offer
+# Buyer models not yet implemented - using raw SQL
+from api.models.offer import Offer
 from api.db.session import get_session
 from api.schemas.common import PaginatedResponse, PaginationParams
 from api.services.auth import get_current_user, require_role
 from api.services.validation import validate_phone_number, validate_zip_code
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 router = APIRouter(prefix="/buyers", tags=["buyers"])
 
@@ -556,7 +556,7 @@ async def add_buyer_offer(
     
     # Verify offer exists
     from sqlalchemy import select
-    from api.db.models.offer import Offer
+    from api.models.offer import Offer
     
     offer_stmt = select(Offer).where(
         Offer.id == offer_data.offer_id,

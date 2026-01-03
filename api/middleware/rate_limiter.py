@@ -13,7 +13,7 @@ from api.core.exceptions import RateLimitError
 from api.core.logging import get_structlog_logger
 from api.services.redis import get_redis_client
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 
 class RateLimitingMiddleware(BaseHTTPMiddleware):

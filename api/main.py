@@ -47,7 +47,7 @@ from api.services.redis import init_redis_pool, get_redis_client
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
-    logger = get_structlog_logger(__name__)
+    logger = get_structlog_logger()
     
     # Startup
     logger.info("application.starting", environment=settings.environment)
@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
 
 # Configure logging before creating app
 configure_structlog()
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 # Create FastAPI application
 app = FastAPI(

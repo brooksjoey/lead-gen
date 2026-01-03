@@ -15,7 +15,7 @@ from api.core.config import settings
 from api.core.exceptions import AuthenticationError, AuthorizationError
 from api.core.logging import get_structlog_logger
 
-logger = get_structlog_logger(__name__)
+logger = get_structlog_logger()
 
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

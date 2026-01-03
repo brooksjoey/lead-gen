@@ -9,14 +9,30 @@ from api.services.routing_engine import (
     load_routing_policy,
     select_buyer_by_strategy,
     EligibleBuyer,
+    BuyerCapacity,
 )
 
 
 def test_select_buyer_by_strategy_priority():
     eligible = [
-        EligibleBuyer(buyer_id=1, routing_priority=2, price_per_lead=10.0, capacity_per_day=None, capacity_per_hour=None),
-        EligibleBuyer(buyer_id=2, routing_priority=1, price_per_lead=15.0, capacity_per_day=None, capacity_per_hour=None),
-        EligibleBuyer(buyer_id=3, routing_priority=1, price_per_lead=12.0, capacity_per_day=None, capacity_per_hour=None),
+        EligibleBuyer(
+            buyer_id=1,
+            routing_priority=2,
+            price_per_lead=10.0,
+            capacity=BuyerCapacity(daily_used=0, daily_limit=None, hourly_used=0, hourly_limit=None, is_capped=False)
+        ),
+        EligibleBuyer(
+            buyer_id=2,
+            routing_priority=1,
+            price_per_lead=15.0,
+            capacity=BuyerCapacity(daily_used=0, daily_limit=None, hourly_used=0, hourly_limit=None, is_capped=False)
+        ),
+        EligibleBuyer(
+            buyer_id=3,
+            routing_priority=1,
+            price_per_lead=12.0,
+            capacity=BuyerCapacity(daily_used=0, daily_limit=None, hourly_used=0, hourly_limit=None, is_capped=False)
+        ),
     ]
     policy_config = {"strategy": "priority"}
     
