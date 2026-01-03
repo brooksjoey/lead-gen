@@ -1,0 +1,434 @@
+The next required update is the lead ingestion classification contract: exactly how source_key (or hostname/path) maps to sources.id and thereby to offers.id deterministically. Update Technical-Architecture-Specifications.md document the same way you did for System-Upgrade-1
+
+Lead Ingestion Classification Contract (REQUIRED UPDATE)
+Purpose
+
+Deterministically resolve every inbound lead to exactly one sources.id and therefore exactly one offers.id (and its market_id and vertical_id) with no hardcoded market/niche logic.
+
+Guarantees
+
+Deterministic: identical request inputs resolve to the same sources.id.
+
+Unambiguous: resolution either yields exactly one source or fails with a classified error.
+
+Stable: changing routing/validation does not change source resolution.
+
+Config-driven: adding markets/verticals/offers/sources requires only DB inserts/updates.
+
+Data Model Requirements (Sources) (UPDATED)
+Sources Table (sources) (UPDATED)
+CREATE TABLE sources (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  offer_id         INTEGER NOT NULL REFERENCES offers(id) ON DELETE RESTRICT,
+
+  -- Stable, human-manageable identifier used by landing pages / integrations
+  source_key      VARCHAR(128) NOT NULL,
+
+  kind            VARCHAR(32) NOT NULL,         -- "landing_page", "partner_api", "embed_form"
+  name            VARCHAR(200) NOT NULL,        -- display label
+
+  -- Deterministic HTTP mapping fields (optional; used when source_key not provided)
+  hostname        VARCHAR(255),                -- exact match on lower(hostname)
+  path_prefix     VARCHAR(255),                -- normalized prefix, must start with "/"
+
+  -- Optional auth for programmatic ingestion (store hash, never plaintext)
+  api_key_hash    VARCHAR(255),
+
+  is_active       BOOLEAN NOT NULL DEFAULT true,
+
+  CONSTRAINT sources_source_key_unique UNIQUE (source_key),
+  CONSTRAINT sources_kind_valid CHECK (kind IN ('landing_page','partner_api','embed_form')),
+  CONSTRAINT sources_path_prefix_format CHECK (path_prefix IS NULL OR path_prefix ~ '^/'),
+  CONSTRAINT sources_http_mapping_requires_hostname CHECK (
+    (path_prefix IS NULL AND hostname IS NULL) OR (hostname IS NOT NULL)
+  )
+);
+
+Required Indexes (Sources)
+CREATE INDEX idx_sources_offer_id ON sources(offer_id);
+CREATE INDEX idx_sources_active_key ON sources(is_active, source_key);
+
+-- HTTP mapping lookup (exact hostname; then longest-prefix match)
+CREATE INDEX idx_sources_active_hostname ON sources(is_active, hostname);
+CREATE INDEX idx_sources_active_hostname_prefix ON sources(is_active, hostname, path_prefix);
+
+Resolution Inputs
+Accepted Identification Inputs (in priority order)
+
+source_id (header or body): direct numeric ID (admin/internal only)
+
+source_key (body): stable string identifier
+
+HTTP mapping: request Host + request Path using sources.hostname + sources.path_prefix
+
+Canonicalization Rules
+
+source_key: strip(); must match [A-Za-z0-9][A-Za-z0-9._:-]{1,127} (2–128 chars)
+
+hostname: lower-case; strip port; if missing Host header → fail
+
+path: must start with /; if empty → /
+
+Deterministic Resolution Algorithm (Normative)
+Priority 1: source_id (Direct)
+
+If source_id is provided:
+
+SELECT source by id AND is_active = true
+
+If not found → 400 invalid_source
+
+If found → accept and bind offer_id
+
+Priority 2: source_key (Stable External ID)
+
+If source_key is provided:
+
+SELECT source by source_key AND is_active = true
+
+If not found → 400 invalid_source_key
+
+If found → accept and bind offer_id
+
+Priority 3: HTTP Mapping (Host + Longest Path Prefix)
+
+If neither source_id nor source_key is provided:
+
+Resolve hostname = lower(strip_port(request.host))
+
+Resolve path = request.url.path (normalized)
+
+Query all active sources with matching hostname and (NULL prefix OR prefix match)
+
+Choose single best match:
+
+Prefer the row with the longest path_prefix satisfying path LIKE path_prefix || '%'
+
+If multiple rows tie for longest prefix → 409 ambiguous_source_mapping
+
+If none found → 400 unmapped_source
+
+Invariants
+
+A resolved sources.id implies exactly one offers.id via sources.offer_id.
+
+offers.id implies market_id and vertical_id as the system-of-record for classification.
+
+Lead insertion MUST store source_id, offer_id, market_id, vertical_id exactly as resolved.
+
+Reference SQL (Normative)
+Resolve by source_key
+SELECT
+  s.id            AS source_id,
+  s.offer_id      AS offer_id,
+  o.market_id     AS market_id,
+  o.vertical_id   AS vertical_id
+FROM sources s
+JOIN offers o ON o.id = s.offer_id
+WHERE s.is_active = true
+  AND s.source_key = :source_key
+LIMIT 1;
+
+Resolve by hostname + longest path_prefix
+WITH candidates AS (
+  SELECT
+    s.id            AS source_id,
+    s.offer_id      AS offer_id,
+    o.market_id     AS market_id,
+    o.vertical_id   AS vertical_id,
+    s.path_prefix   AS path_prefix,
+    LENGTH(COALESCE(s.path_prefix, '')) AS prefix_len
+  FROM sources s
+  JOIN offers o ON o.id = s.offer_id
+  WHERE s.is_active = true
+    AND s.hostname = :hostname
+    AND (
+      s.path_prefix IS NULL
+      OR :path LIKE s.path_prefix || '%'
+    )
+),
+ranked AS (
+  SELECT *
+  FROM candidates
+  ORDER BY prefix_len DESC, source_id ASC
+)
+SELECT *
+FROM ranked
+LIMIT 2;
+
+
+Interpretation rule:
+
+0 rows → unmapped
+
+1 row → resolved
+
+2 rows where prefix_len equal → ambiguous (fail)
+
+2 rows where prefix_len differs → take first (longest prefix)
+
+API Contract Changes (Lead Ingestion) (UPDATED)
+Request Body (Classification Fields)
+{
+  "source_key": "austin-plumbing-v1",
+  "idempotency_key": "c1a9d3b2d6c84c2b9b6f9adf4b4e1c1f",
+  "name": "John Smith",
+  "email": "john@example.com",
+  "phone": "+15125550123",
+  "country_code": "US",
+  "postal_code": "78701",
+  "message": "Emergency plumbing needed",
+  "utm_source": "google",
+  "utm_medium": "cpc",
+  "utm_campaign": "plumbing_austin",
+  "consent": true,
+  "gdpr_consent": true
+}
+
+Response (Includes Classification)
+{
+  "lead_id": 12345,
+  "status": "accepted",
+  "buyer_id": 7,
+  "source_id": 31,
+  "offer_id": 12,
+  "market_id": 4,
+  "vertical_id": 2,
+  "price": 45.00
+}
+
+10/10 Reference Implementation (Async SQLAlchemy 2.x)
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import Request
+
+
+_SOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$")
+
+
+class SourceResolutionError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class ResolvedClassification:
+    source_id: int
+    offer_id: int
+    market_id: int
+    vertical_id: int
+
+
+def _strip_port(host: str) -> str:
+    host = host.strip()
+    if not host:
+        return host
+    # IPv6 in brackets: [::1]:8000
+    if host.startswith("["):
+        end = host.find("]")
+        if end != -1:
+            return host[: end + 1].lower()
+        return host.lower()
+    # hostname:port
+    if ":" in host:
+        return host.split(":", 1)[0].lower()
+    return host.lower()
+
+
+def _normalize_path(path: str) -> str:
+    if not path:
+        return "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def _validate_source_key(source_key: str) -> str:
+    source_key = source_key.strip()
+    if not _SOURCE_KEY_RE.match(source_key):
+        raise SourceResolutionError(
+            code="invalid_source_key_format",
+            message="source_key must match /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/",
+        )
+    return source_key
+
+
+def derive_idempotency_key(
+    *,
+    source_id: int,
+    email: str,
+    phone: str,
+    postal_code: str,
+    message: Optional[str],
+) -> str:
+    # Deterministic fallback when client does not provide idempotency_key.
+    # Scoped by source_id so distinct sources do not collide.
+    parts = [
+        str(source_id),
+        email.strip().lower(),
+        re.sub(r"\s+", "", phone.strip()),
+        postal_code.strip().upper(),
+        (message or "").strip(),
+    ]
+    raw = "\n".join(parts).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+async def resolve_classification(
+    *,
+    session: AsyncSession,
+    request: Request,
+    source_id: Optional[int],
+    source_key: Optional[str],
+) -> ResolvedClassification:
+    # Priority 1: direct source_id (internal/admin)
+    if source_id is not None:
+        row = await session.execute(
+            text(
+                """
+                SELECT
+                  s.id        AS source_id,
+                  s.offer_id  AS offer_id,
+                  o.market_id AS market_id,
+                  o.vertical_id AS vertical_id
+                FROM sources s
+                JOIN offers o ON o.id = s.offer_id
+                WHERE s.is_active = true
+                  AND s.id = :source_id
+                LIMIT 1
+                """
+            ),
+            {"source_id": int(source_id)},
+        )
+        rec = row.mappings().first()
+        if not rec:
+            raise SourceResolutionError("invalid_source", "source_id not found or inactive")
+        return ResolvedClassification(
+            source_id=int(rec["source_id"]),
+            offer_id=int(rec["offer_id"]),
+            market_id=int(rec["market_id"]),
+            vertical_id=int(rec["vertical_id"]),
+        )
+
+    # Priority 2: source_key (stable external)
+    if source_key:
+        sk = _validate_source_key(source_key)
+        row = await session.execute(
+            text(
+                """
+                SELECT
+                  s.id        AS source_id,
+                  s.offer_id  AS offer_id,
+                  o.market_id AS market_id,
+                  o.vertical_id AS vertical_id
+                FROM sources s
+                JOIN offers o ON o.id = s.offer_id
+                WHERE s.is_active = true
+                  AND s.source_key = :source_key
+                LIMIT 1
+                """
+            ),
+            {"source_key": sk},
+        )
+        rec = row.mappings().first()
+        if not rec:
+            raise SourceResolutionError("invalid_source_key", "source_key not found or inactive")
+        return ResolvedClassification(
+            source_id=int(rec["source_id"]),
+            offer_id=int(rec["offer_id"]),
+            market_id=int(rec["market_id"]),
+            vertical_id=int(rec["vertical_id"]),
+        )
+
+    # Priority 3: HTTP mapping (Host + longest prefix)
+    host = request.headers.get("host", "").strip()
+    hostname = _strip_port(host)
+    if not hostname:
+        raise SourceResolutionError("missing_host_header", "Host header is required for source mapping")
+
+    path = _normalize_path(request.url.path)
+
+    row = await session.execute(
+        text(
+            """
+            WITH candidates AS (
+              SELECT
+                s.id            AS source_id,
+                s.offer_id      AS offer_id,
+                o.market_id     AS market_id,
+                o.vertical_id   AS vertical_id,
+                s.path_prefix   AS path_prefix,
+                LENGTH(COALESCE(s.path_prefix, '')) AS prefix_len
+              FROM sources s
+              JOIN offers o ON o.id = s.offer_id
+              WHERE s.is_active = true
+                AND s.hostname = :hostname
+                AND (
+                  s.path_prefix IS NULL
+                  OR :path LIKE s.path_prefix || '%'
+                )
+            ),
+            ranked AS (
+              SELECT *
+              FROM candidates
+              ORDER BY prefix_len DESC, source_id ASC
+            )
+            SELECT *
+            FROM ranked
+            LIMIT 2
+            """
+        ),
+        {"hostname": hostname, "path": path},
+    )
+    recs = list(row.mappings().all())
+
+    if not recs:
+        raise SourceResolutionError("unmapped_source", "No active source matched hostname/path")
+
+    if len(recs) == 1:
+        rec = recs[0]
+        return ResolvedClassification(
+            source_id=int(rec["source_id"]),
+            offer_id=int(rec["offer_id"]),
+            market_id=int(rec["market_id"]),
+            vertical_id=int(rec["vertical_id"]),
+        )
+
+    # Two candidates returned: verify ambiguity rules.
+    first, second = recs[0], recs[1]
+    if int(first["prefix_len"]) == int(second["prefix_len"]):
+        raise SourceResolutionError(
+            "ambiguous_source_mapping",
+            "Multiple sources matched with equal specificity (path_prefix length)",
+        )
+
+    return ResolvedClassification(
+        source_id=int(first["source_id"]),
+        offer_id=int(first["offer_id"]),
+        market_id=int(first["market_id"]),
+        vertical_id=int(first["vertical_id"]),
+    )
+
+Operational Rules (Non-Negotiable for Seamless Transition)
+
+Every new landing page/integration must be provisioned with:
+
+sources.source_key (recommended) and/or hostname + path_prefix
+
+sources.offer_id pointing to the intended offers.id
+
+Any time two sources share the same hostname, path_prefix MUST be unique and non-overlapping by length tie to avoid ambiguity.
+
+If you rely on HTTP mapping, use distinct path prefixes per offer (e.g., /lp/plumbing/, /lp/roofing/) and avoid shared roots like /.

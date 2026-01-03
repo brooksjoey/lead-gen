@@ -1,0 +1,543 @@
+The next required update, it is the idempotency contract (exactly when client-provided vs derived keys are accepted, and the database uniqueness scope). The same instructions for this update that applied to upgrades previous upgrades, and as a reminder, lets make sure we continue to updates the Reference Architecture Diagram as we go. .
+
+## Duplicate Detection Contract (REQUIRED UPGRADE)
+
+### Purpose
+
+Prevent low-quality “repeat submissions” from being treated as new leads while preserving correct behavior for:
+
+* multi-market / multi-vertical offers
+* source-scoped idempotency
+* configurable per-offer windows and rules
+* concurrency-safe ingestion
+
+### Definitions
+
+* **Idempotency:** same request replay → same `(source_id, idempotency_key)` → same lead row.
+* **Duplicate detection:** different request (new idempotency key) but materially the same lead within a configured window → policy-driven outcome (reject, flag, accept).
+
+### Scope
+
+Duplicate detection is executed during ingestion **after** classification + idempotent lead row creation, and before validation/routing transitions.
+
+---
+
+## Normative Policy Inputs (from validation_policies.rules)
+
+`validation_policies.rules` MUST support the following keys:
+
+```json
+{
+  "duplicate_detection": {
+    "enabled": true,
+    "window_hours": 24,
+    "scope": "offer",                   
+    "keys": ["phone", "email"],         
+    "match_mode": "any",                
+    "exclude_statuses": ["rejected"],    
+    "include_sources": "any",           
+    "action": "reject",                 
+    "reason_code": "duplicate_recent",
+    "min_fields": ["phone"],            
+    "normalize": {
+      "email": "lower_trim",
+      "phone": "e164_or_digits",
+      "postal_code": "upper_trim"
+    }
+  }
+}
+```
+
+### Semantics
+
+* `enabled`: if false/missing → duplicate detection is skipped.
+* `window_hours`: lookback window for duplicate checks.
+* `scope`: `"offer"` (required). Duplicate detection must be scoped at least to `offer_id`.
+* `keys`: subset of `["phone","email"]` (required).
+* `match_mode`:
+
+  * `"any"`: duplicate if any key matches within window
+  * `"all"`: duplicate if all configured keys match within window (requires presence of all keys)
+* `exclude_statuses`: prior leads with these statuses are ignored in duplicate detection.
+* `include_sources`:
+
+  * `"any"`: match across all sources within the offer
+  * `"same_source_only"`: match only within the same `source_id`
+* `action`:
+
+  * `"reject"`: set lead status to `rejected` with reason and stop pipeline
+  * `"flag"`: continue pipeline but set a flag + record duplicate reference
+  * `"accept"`: record duplicate reference but do not change behavior
+* `min_fields`: minimum fields required to run check; if not present → skip check.
+* `normalize`: canonicalization strategy for email/phone.
+
+---
+
+## Required Schema Additions (Normative)
+
+### Leads: Add normalized columns + duplicate reference
+
+```sql
+ALTER TABLE leads
+  ADD COLUMN IF NOT EXISTS normalized_email VARCHAR(320),
+  ADD COLUMN IF NOT EXISTS normalized_phone VARCHAR(32),
+  ADD COLUMN IF NOT EXISTS duplicate_of_lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS is_duplicate BOOLEAN NOT NULL DEFAULT false;
+
+-- Enforce basic length constraints via CHECKs (optional, recommended)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'leads_normalized_phone_len') THEN
+    ALTER TABLE leads
+      ADD CONSTRAINT leads_normalized_phone_len
+      CHECK (normalized_phone IS NULL OR LENGTH(normalized_phone) BETWEEN 7 AND 32);
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'leads_normalized_email_len') THEN
+    ALTER TABLE leads
+      ADD CONSTRAINT leads_normalized_email_len
+      CHECK (normalized_email IS NULL OR LENGTH(normalized_email) BETWEEN 3 AND 320);
+  END IF;
+END $$;
+```
+
+### Optional: Separate duplicate events table (audit-grade)
+
+```sql
+CREATE TABLE IF NOT EXISTS lead_duplicate_events (
+  id                BIGSERIAL PRIMARY KEY,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  lead_id           INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  matched_lead_id   INTEGER NOT NULL REFERENCES leads(id) ON DELETE RESTRICT,
+
+  offer_id          INTEGER NOT NULL REFERENCES offers(id) ON DELETE RESTRICT,
+  source_id         INTEGER NOT NULL REFERENCES sources(id) ON DELETE RESTRICT,
+
+  match_keys        TEXT[] NOT NULL,          -- e.g., {"phone"} or {"email","phone"}
+  window_hours      INTEGER NOT NULL,
+  match_mode        VARCHAR(8) NOT NULL,      -- "any" | "all"
+  include_sources   VARCHAR(16) NOT NULL,     -- "any" | "same_source_only"
+
+  action            VARCHAR(8) NOT NULL,      -- "reject" | "flag" | "accept"
+  reason_code       VARCHAR(64) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lde_lead_id ON lead_duplicate_events(lead_id);
+CREATE INDEX IF NOT EXISTS idx_lde_offer_created_at ON lead_duplicate_events(offer_id, created_at DESC);
+```
+
+---
+
+## Index Design (Normative)
+
+Duplicate lookup must be fast under high write volume. Use partial indexes by offer and recent time, keyed by normalized fields.
+
+```sql
+-- Lookup by offer + normalized_phone within time window
+CREATE INDEX IF NOT EXISTS idx_leads_offer_norm_phone_created
+  ON leads(offer_id, normalized_phone, created_at DESC)
+  WHERE normalized_phone IS NOT NULL;
+
+-- Lookup by offer + normalized_email within time window
+CREATE INDEX IF NOT EXISTS idx_leads_offer_norm_email_created
+  ON leads(offer_id, normalized_email, created_at DESC)
+  WHERE normalized_email IS NOT NULL;
+
+-- If include_sources="same_source_only" is used commonly:
+CREATE INDEX IF NOT EXISTS idx_leads_offer_source_norm_phone_created
+  ON leads(offer_id, source_id, normalized_phone, created_at DESC)
+  WHERE normalized_phone IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_leads_offer_source_norm_email_created
+  ON leads(offer_id, source_id, normalized_email, created_at DESC)
+  WHERE normalized_email IS NOT NULL;
+```
+
+---
+
+## Normalization Strategy (Normative)
+
+### Email normalization
+
+* `lower_trim`: `strip()`, lowercase.
+* Reject empty after trim → NULL.
+
+### Phone normalization
+
+Two supported modes:
+
+* `e164_or_digits`:
+
+  * If already E.164 (`+` followed by digits, length 8–16), keep.
+  * Else strip all non-digits.
+  * If result length < 7 → NULL.
+
+No country inference is performed in duplicate detection. If you want country-aware parsing, do it earlier and store canonical E.164 in `phone`.
+
+---
+
+## Duplicate Detection Algorithm (Normative)
+
+### Required Inputs
+
+* resolved classification: `offer_id`, `source_id`
+* persisted lead row: `lead_id`, `created_at`
+* policy: `validation_policies.rules.duplicate_detection`
+
+### Output
+
+One of:
+
+* `not_duplicate`
+* `duplicate_reject(matched_lead_id)`
+* `duplicate_flag(matched_lead_id)`
+* `duplicate_accept(matched_lead_id)`
+
+### Matching Rules
+
+* Window: consider prior leads where `created_at >= now() - window_hours`.
+* Exclusions: ignore prior leads whose status is in `exclude_statuses`.
+* Scope: always `offer_id = :offer_id`.
+* Sources:
+
+  * `any`: ignore `source_id`
+  * `same_source_only`: require `source_id = :source_id`
+* Match keys:
+
+  * `any`: if either phone or email matches
+  * `all`: both must match (and both must be present)
+
+---
+
+##  Reference Implementation (Async SQLAlchemy 2.x)
+
+```python
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Iterable, Literal, Optional, Sequence
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+MatchMode = Literal["any", "all"]
+IncludeSources = Literal["any", "same_source_only"]
+DuplicateAction = Literal["reject", "flag", "accept"]
+
+
+class DuplicateDetectionError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class DuplicatePolicy:
+    enabled: bool
+    window_hours: int
+    scope: Literal["offer"]
+    keys: Sequence[Literal["phone", "email"]]
+    match_mode: MatchMode
+    exclude_statuses: Sequence[str]
+    include_sources: IncludeSources
+    action: DuplicateAction
+    reason_code: str
+    min_fields: Sequence[Literal["phone", "email"]]
+    normalize_email: Literal["lower_trim"]
+    normalize_phone: Literal["e164_or_digits"]
+
+
+@dataclass(frozen=True)
+class DuplicateResult:
+    is_duplicate: bool
+    action: Optional[DuplicateAction]
+    matched_lead_id: Optional[int]
+    matched_keys: Sequence[str]
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_E164_RE = re.compile(r"^\+[1-9]\d{7,15}$")
+
+
+def normalize_email(email: Optional[str]) -> Optional[str]:
+    if not email:
+        return None
+    e = email.strip().lower()
+    if not e:
+        return None
+    # Syntax is validated elsewhere; here we only ensure it is plausible.
+    if not _EMAIL_RE.match(e):
+        return None
+    return e
+
+
+def normalize_phone(phone: Optional[str]) -> Optional[str]:
+    if not phone:
+        return None
+    p = phone.strip()
+    if not p:
+        return None
+    if _E164_RE.match(p):
+        return p
+    digits = re.sub(r"\D+", "", p)
+    if len(digits) < 7:
+        return None
+    return digits
+
+
+def _require_min_fields(
+    *,
+    policy: DuplicatePolicy,
+    normalized_phone: Optional[str],
+    normalized_email: Optional[str],
+) -> bool:
+    for f in policy.min_fields:
+        if f == "phone" and not normalized_phone:
+            return False
+        if f == "email" and not normalized_email:
+            return False
+    return True
+
+
+async def detect_duplicate(
+    *,
+    session: AsyncSession,
+    lead_id: int,
+    offer_id: int,
+    source_id: int,
+    policy: DuplicatePolicy,
+    phone: Optional[str],
+    email: Optional[str],
+) -> DuplicateResult:
+    if not policy.enabled:
+        return DuplicateResult(False, None, None, ())
+
+    if policy.scope != "offer":
+        raise DuplicateDetectionError("invalid_policy_scope", "duplicate detection scope must be 'offer'")
+
+    norm_phone = normalize_phone(phone) if "phone" in policy.keys else None
+    norm_email = normalize_email(email) if "email" in policy.keys else None
+
+    if not _require_min_fields(policy=policy, normalized_phone=norm_phone, normalized_email=norm_email):
+        return DuplicateResult(False, None, None, ())
+
+    if not norm_phone and not norm_email:
+        return DuplicateResult(False, None, None, ())
+
+    window_hours = int(policy.window_hours)
+    if window_hours <= 0 or window_hours > 24 * 365:
+        raise DuplicateDetectionError("invalid_window_hours", "window_hours must be within (0, 8760]")
+
+    include_sources = policy.include_sources
+    match_mode = policy.match_mode
+
+    # Candidate selection SQL: fetch the best match (most recent) and which keys matched.
+    # We ignore the current lead_id and only look back within the window.
+    sql = """
+    WITH candidates AS (
+      SELECT
+        l.id AS matched_lead_id,
+        l.created_at AS matched_created_at,
+        (CASE WHEN :norm_phone IS NOT NULL AND l.normalized_phone = :norm_phone THEN 1 ELSE 0 END) AS phone_match,
+        (CASE WHEN :norm_email IS NOT NULL AND l.normalized_email = :norm_email THEN 1 ELSE 0 END) AS email_match
+      FROM leads l
+      WHERE l.offer_id = :offer_id
+        AND l.id <> :lead_id
+        AND l.created_at >= (CURRENT_TIMESTAMP - (:window_hours::int * INTERVAL '1 hour'))
+        AND (l.status <> ALL(:exclude_statuses))
+        AND (:include_sources_any OR l.source_id = :source_id)
+        AND (
+          (:norm_phone IS NOT NULL AND l.normalized_phone = :norm_phone)
+          OR
+          (:norm_email IS NOT NULL AND l.normalized_email = :norm_email)
+        )
+    ),
+    filtered AS (
+      SELECT *
+      FROM candidates
+      WHERE
+        CASE
+          WHEN :match_mode = 'any' THEN (phone_match = 1 OR email_match = 1)
+          WHEN :match_mode = 'all' THEN
+            (
+              (:norm_phone IS NULL OR phone_match = 1)
+              AND
+              (:norm_email IS NULL OR email_match = 1)
+              AND
+              -- for 'all' ensure both keys requested are present and match
+              (CASE
+                 WHEN (:norm_phone IS NOT NULL AND :norm_email IS NOT NULL) THEN (phone_match = 1 AND email_match = 1)
+                 ELSE true
+               END)
+            )
+          ELSE false
+        END
+    )
+    SELECT
+      matched_lead_id,
+      phone_match,
+      email_match
+    FROM filtered
+    ORDER BY matched_created_at DESC, matched_lead_id DESC
+    LIMIT 1
+    """
+
+    res = await session.execute(
+        text(sql),
+        {
+            "offer_id": offer_id,
+            "source_id": source_id,
+            "lead_id": lead_id,
+            "window_hours": window_hours,
+            "exclude_statuses": list(policy.exclude_statuses) if policy.exclude_statuses else [],
+            "include_sources_any": include_sources == "any",
+            "match_mode": match_mode,
+            "norm_phone": norm_phone,
+            "norm_email": norm_email,
+        },
+    )
+    rec = res.mappings().first()
+    if not rec:
+        # Persist normalized values even if not a duplicate
+        await _persist_normalized_fields(
+            session=session,
+            lead_id=lead_id,
+            normalized_phone=norm_phone,
+            normalized_email=norm_email,
+        )
+        return DuplicateResult(False, None, None, ())
+
+    matched_lead_id = int(rec["matched_lead_id"])
+    matched_keys = []
+    if int(rec["phone_match"]) == 1:
+        matched_keys.append("phone")
+    if int(rec["email_match"]) == 1:
+        matched_keys.append("email")
+
+    # Persist normalized values + duplicate flags deterministically.
+    await _mark_duplicate(
+        session=session,
+        lead_id=lead_id,
+        normalized_phone=norm_phone,
+        normalized_email=norm_email,
+        matched_lead_id=matched_lead_id,
+        action=policy.action,
+        reason_code=policy.reason_code,
+    )
+
+    return DuplicateResult(True, policy.action, matched_lead_id, tuple(matched_keys))
+
+
+async def _persist_normalized_fields(
+    *,
+    session: AsyncSession,
+    lead_id: int,
+    normalized_phone: Optional[str],
+    normalized_email: Optional[str],
+) -> None:
+    await session.execute(
+        text(
+            """
+            UPDATE leads
+            SET
+              updated_at = CURRENT_TIMESTAMP,
+              normalized_phone = COALESCE(:normalized_phone, normalized_phone),
+              normalized_email = COALESCE(:normalized_email, normalized_email)
+            WHERE id = :lead_id
+            """
+        ),
+        {
+            "lead_id": lead_id,
+            "normalized_phone": normalized_phone,
+            "normalized_email": normalized_email,
+        },
+    )
+
+
+async def _mark_duplicate(
+    *,
+    session: AsyncSession,
+    lead_id: int,
+    normalized_phone: Optional[str],
+    normalized_email: Optional[str],
+    matched_lead_id: int,
+    action: DuplicateAction,
+    reason_code: str,
+) -> None:
+    # Action semantics:
+    # - reject: transition to rejected if still received (do not clobber later states)
+    # - flag/accept: mark is_duplicate but do not change status
+    if action == "reject":
+        await session.execute(
+            text(
+                """
+                UPDATE leads
+                SET
+                  updated_at = CURRENT_TIMESTAMP,
+                  normalized_phone = COALESCE(:normalized_phone, normalized_phone),
+                  normalized_email = COALESCE(:normalized_email, normalized_email),
+                  is_duplicate = true,
+                  duplicate_of_lead_id = :matched_lead_id,
+                  status = CASE WHEN status = 'received' THEN 'rejected' ELSE status END,
+                  validation_reason = CASE WHEN status = 'received' THEN :reason_code ELSE validation_reason END
+                WHERE id = :lead_id
+                """
+            ),
+            {
+                "lead_id": lead_id,
+                "normalized_phone": normalized_phone,
+                "normalized_email": normalized_email,
+                "matched_lead_id": matched_lead_id,
+                "reason_code": reason_code,
+            },
+        )
+    else:
+        await session.execute(
+            text(
+                """
+                UPDATE leads
+                SET
+                  updated_at = CURRENT_TIMESTAMP,
+                  normalized_phone = COALESCE(:normalized_phone, normalized_phone),
+                  normalized_email = COALESCE(:normalized_email, normalized_email),
+                  is_duplicate = true,
+                  duplicate_of_lead_id = :matched_lead_id
+                WHERE id = :lead_id
+                """
+            ),
+            {
+                "lead_id": lead_id,
+                "normalized_phone": normalized_phone,
+                "normalized_email": normalized_email,
+                "matched_lead_id": matched_lead_id,
+            },
+        )
+```
+
+---
+
+## Required Ingestion Integration Point (Normative)
+
+After `resolve_classification()` and `upsert_lead_stub_idempotent()`:
+
+1. Load offer’s `validation_policy.rules`
+2. Parse `duplicate_detection` section into `DuplicatePolicy`
+3. Call `detect_duplicate(...)`
+4. If result is `reject`:
+
+   * return `202` or `400` based on your API semantics (recommend `202` with status `rejected` to keep clients simple)
+   * do not proceed to validation/routing/billing
+5. Otherwise proceed
+
+---
+
+## Query/Index Justification (Normative)
+
+* `(offer_id, normalized_phone|normalized_email, created_at DESC)` supports tight lookbacks per offer.
+* Optional `(offer_id, source_id, ...)` indexes prevent scanning when `include_sources="same_source_only"` is common.
+* Using normalized columns avoids repeated expensive normalization during query time and makes matching consistent across all sources and markets.

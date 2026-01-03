@@ -1,0 +1,652 @@
+Some upgrades are necessary. The goal is “same platform, any niche/geo, seamless transition,” the architecture should treat vertical + market as first-class configuration, not implied constants.
+
+Required platform shifts
+1) Introduce a Market + Vertical abstraction
+
+Add entities (or config objects) that everything else references:
+
+verticals: plumbing, roof repair, junk removal, etc.
+
+markets: “Austin TX,” “Tampa FL,” or “ZIP cluster X”
+
+offers (optional): a specific combination of vertical + market + pricing + rules
+
+Every lead must be attributable to:
+
+vertical_id
+
+market_id
+
+source_id (landing page / campaign)
+
+2) Replace hardcoded validation/routing with rule sets
+
+Anything like:
+
+ZIP regex (^787...)
+
+“Texas area codes”
+
+allowed ZIP prefixes list
+
+“plumber” buyer assumptions
+
+…must move into rules stored per market/vertical, e.g.:
+
+market_rules: allowed ZIPs (or geo polygon), allowed cities, phone region expectations, duplicate window, business hours, etc.
+
+vertical_rules: required fields, lead qualification constraints, category-specific checks (e.g., “job type” for HVAC)
+
+routing_policy: strategy, caps, exclusivity rules, rotation logic, buyer SLAs
+
+3) Buyers must be scoped to market + vertical
+
+A buyer is not just “active.” They’re active for specific combinations:
+
+buyer service areas (ZIP/city/polygon)
+
+buyer vertical(s)
+
+capacity rules (daily cap, after-hours, pause)
+
+pricing per offer (not one global price_per_lead)
+
+4) Landing pages and attribution must map deterministically
+
+A lead should resolve market_id and vertical_id from:
+
+landing page config (preferred)
+
+campaign params
+
+subdomain/path mapping
+
+This is what makes transitions seamless: you deploy a new landing page config, not new code.
+
+5) Billing must be per offer (not global)
+
+Price should be calculated from:
+
+offer defaults
+
+buyer overrides
+
+exclusivity premium
+
+time-of-day premium (optional)
+
+Then recorded on the lead at delivery time (immutable).
+
+“Seamless transition” acceptance criteria (practical)
+
+You’re there when adding a new niche/market requires only:
+
+create a market + vertical
+
+attach rule sets + routing policy
+
+onboard buyers + their service areas
+
+publish a landing page config pointing to that offer
+
+…and no code changes.
+
+
+
+
+
+BASED ON THESE GOALS, THE UPDATED SYSTEM OVERVIEW IS BELOW. THE Technical-Architecture-Specification.md file must be updated to reflect this change. IT IS IMPORTANT THAT THE FILE IS UPDATED WIT THE EXACT CONTENT FROM THIS DOCUMENT. NOT ALL SECTIONS ARE AFFECTED, BUT THOSE THAT ARE MUST BE UPDATED ONCE THAT UPDATE IS COMPLETE, THIS FILE CAN BE DISCARDED, BUT WE NEED TO ENSURE THE CONTENT IS TRANFERRED TO Technical-Architecture-Specification.md PRECISELY BEFORE DOING SO.
+
+System Overview (UPDATED)
+
+LeadGen v1.0 is a deterministic, event-driven lead distribution platform implementing a B2B2C marketplace model for configurable local service verticals and markets. The system operates on a pay-per-lead model with automated validation, routing, billing, and delivery pipelines.
+Seamless Transition Goal: adding a new niche and/or geography is accomplished by inserting configuration and reference data (market/vertical/offer/source/rules), without code changes.
+
+Database Schema Specification (UPDATED)
+Lead Status and Billing Status Enums (UNCHANGED)
+CREATE TYPE lead_status AS ENUM (
+  'received', 'validated', 'delivered', 'accepted', 'rejected'
+);
+
+CREATE TYPE billing_status AS ENUM (
+  'pending', 'billed', 'paid', 'disputed', 'refunded'
+);
+
+Invoice Status and Payment Method Enums (UNCHANGED)
+CREATE TYPE invoice_status AS ENUM (
+  'draft', 'sent', 'paid', 'overdue', 'cancelled', 'disputed'
+);
+
+CREATE TYPE payment_method AS ENUM (
+  'stripe', 'manual', 'bank_transfer', 'check'
+);
+
+NEW: Markets (markets)
+CREATE TABLE markets (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  name            VARCHAR(200) NOT NULL,          -- e.g., "Austin, TX", "Tampa, FL"
+  country_code    CHAR(2) NOT NULL DEFAULT 'US',  -- ISO 3166-1 alpha-2
+  region_code     VARCHAR(20),                    -- e.g., "US-TX" (ISO 3166-2), optional
+  timezone        VARCHAR(64) NOT NULL,           -- e.g., "America/Chicago"
+  currency        CHAR(3) NOT NULL DEFAULT 'USD', -- ISO 4217
+
+  is_active       BOOLEAN NOT NULL DEFAULT true
+);
+
+NEW: Verticals (verticals)
+CREATE TABLE verticals (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  slug            VARCHAR(64) NOT NULL UNIQUE,    -- e.g., "plumbing", "roofing"
+  name            VARCHAR(200) NOT NULL,          -- display name
+  is_active       BOOLEAN NOT NULL DEFAULT true
+);
+
+NEW: Validation Policies (validation_policies)
+
+Stores market/vertical specific validation rules as configuration, not code.
+
+CREATE TABLE validation_policies (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  name            VARCHAR(200) NOT NULL,
+  version         INTEGER NOT NULL DEFAULT 1,
+
+  -- Rules live here (examples: allowed_postal_codes, duplicate_window_hours, phone_region, etc.)
+  rules           JSONB NOT NULL,
+
+  is_active       BOOLEAN NOT NULL DEFAULT true,
+
+  CONSTRAINT validation_policies_rules_is_object
+    CHECK (jsonb_typeof(rules) = 'object')
+);
+
+NEW: Routing Policies (routing_policies)
+CREATE TABLE routing_policies (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  name            VARCHAR(200) NOT NULL,
+  version         INTEGER NOT NULL DEFAULT 1,
+
+  -- Config: strategy, exclusivity behavior, fairness, caps, tie-breakers, etc.
+  config          JSONB NOT NULL,
+
+  is_active       BOOLEAN NOT NULL DEFAULT true,
+
+  CONSTRAINT routing_policies_config_is_object
+    CHECK (jsonb_typeof(config) = 'object')
+);
+
+NEW: Offers (offers)
+
+Canonical unit of sale: a vertical in a market, with attached validation + routing policies.
+
+CREATE TABLE offers (
+  id                    SERIAL PRIMARY KEY,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at            TIMESTAMPTZ,
+
+  market_id             INTEGER NOT NULL REFERENCES markets(id) ON DELETE RESTRICT,
+  vertical_id           INTEGER NOT NULL REFERENCES verticals(id) ON DELETE RESTRICT,
+
+  name                  VARCHAR(200) NOT NULL,           -- e.g., "Emergency Plumbing - Austin"
+  is_active             BOOLEAN NOT NULL DEFAULT true,
+
+  default_price_per_lead DECIMAL(10,2) NOT NULL,
+  invoice_threshold     DECIMAL(10,2) NOT NULL DEFAULT 500.00,
+
+  validation_policy_id  INTEGER NOT NULL REFERENCES validation_policies(id) ON DELETE RESTRICT,
+  routing_policy_id     INTEGER NOT NULL REFERENCES routing_policies(id) ON DELETE RESTRICT,
+
+  CONSTRAINT offers_unique_market_vertical_name UNIQUE (market_id, vertical_id, name),
+  CONSTRAINT offers_price_positive CHECK (default_price_per_lead > 0),
+  CONSTRAINT offers_threshold_non_negative CHECK (invoice_threshold >= 0)
+);
+
+NEW: Sources (sources)
+
+Represents where a lead originated (landing page, API partner, form embed), mapped to an offer.
+
+CREATE TABLE sources (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  offer_id         INTEGER NOT NULL REFERENCES offers(id) ON DELETE RESTRICT,
+
+  kind            VARCHAR(32) NOT NULL,         -- "landing_page", "partner_api", "embed_form"
+  name            VARCHAR(200) NOT NULL,        -- display label
+
+  -- Used to deterministically resolve source -> offer at ingestion
+  hostname        VARCHAR(255),
+  path_prefix     VARCHAR(255),
+
+  -- Optional auth for programmatic ingestion
+  api_key_hash    VARCHAR(255),
+
+  is_active       BOOLEAN NOT NULL DEFAULT true
+);
+
+UPDATED: Buyers (buyers)
+
+Remove CSV service area fields and global “exclusive”; scope is per-offer/service-area.
+
+CREATE TABLE buyers (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  -- Business information
+  name            VARCHAR(200) NOT NULL,
+  email           VARCHAR(200) NOT NULL UNIQUE,
+  phone           VARCHAR(20) NOT NULL,
+  company         VARCHAR(200),
+
+  -- Delivery defaults (may be overridden per offer)
+  webhook_url     VARCHAR(500),
+  webhook_secret  VARCHAR(200),
+  email_notifications BOOLEAN NOT NULL DEFAULT true,
+  sms_notifications   BOOLEAN NOT NULL DEFAULT false,
+
+  -- Buyer lifecycle
+  is_active       BOOLEAN NOT NULL DEFAULT true,
+
+  -- Billing
+  balance         DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  credit_limit    DECIMAL(10,2),
+
+  billing_cycle   VARCHAR(20) NOT NULL DEFAULT 'weekly',
+  payment_method  VARCHAR(50),
+  payment_method_id VARCHAR(200),
+
+  CONSTRAINT check_non_negative_balance CHECK (balance >= 0)
+);
+
+NEW: Buyer Offer Enrollment (buyer_offers)
+
+Defines buyer participation and pricing/capacity per offer.
+
+CREATE TABLE buyer_offers (
+  id                  SERIAL PRIMARY KEY,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMPTZ,
+
+  buyer_id            INTEGER NOT NULL REFERENCES buyers(id) ON DELETE CASCADE,
+  offer_id            INTEGER NOT NULL REFERENCES offers(id) ON DELETE CASCADE,
+
+  is_active           BOOLEAN NOT NULL DEFAULT true,
+
+  routing_priority    INTEGER NOT NULL DEFAULT 1,
+  capacity_per_day    INTEGER,                  -- NULL = unlimited
+  capacity_per_hour   INTEGER,                  -- optional
+
+  price_per_lead      DECIMAL(10,2),            -- NULL => offers.default_price_per_lead
+
+  -- Optional per-offer delivery overrides
+  webhook_url_override VARCHAR(500),
+  email_override       VARCHAR(200),
+  sms_override         VARCHAR(20),
+
+  -- Optional buyer constraints for routing
+  min_balance_required DECIMAL(10,2),           -- NULL = no minimum
+  pause_until          TIMESTAMPTZ,
+
+  CONSTRAINT buyer_offers_unique UNIQUE (buyer_id, offer_id),
+  CONSTRAINT buyer_offers_priority_positive CHECK (routing_priority >= 1),
+  CONSTRAINT buyer_offers_capacity_positive CHECK (capacity_per_day IS NULL OR capacity_per_day >= 0),
+  CONSTRAINT buyer_offers_price_positive CHECK (price_per_lead IS NULL OR price_per_lead > 0)
+);
+
+NEW: Buyer Service Areas (buyer_service_areas)
+
+Normalizes service coverage. Eliminates CSV fields and enables multi-market seamless expansion.
+
+CREATE TABLE buyer_service_areas (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  buyer_id        INTEGER NOT NULL REFERENCES buyers(id) ON DELETE CASCADE,
+  market_id       INTEGER NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+
+  scope_type      VARCHAR(16) NOT NULL,     -- "postal_code", "city"
+  scope_value     VARCHAR(64) NOT NULL,     -- e.g., "78701" or "Austin"
+
+  is_active       BOOLEAN NOT NULL DEFAULT true,
+
+  CONSTRAINT buyer_service_areas_scope_type_valid
+    CHECK (scope_type IN ('postal_code','city')),
+  CONSTRAINT buyer_service_areas_unique UNIQUE (buyer_id, market_id, scope_type, scope_value)
+);
+
+NEW: Offer Exclusivity Rules (offer_exclusivities)
+
+Enforces exclusive buyer per offer+service-area (postal_code or city).
+
+CREATE TABLE offer_exclusivities (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  offer_id         INTEGER NOT NULL REFERENCES offers(id) ON DELETE CASCADE,
+  scope_type       VARCHAR(16) NOT NULL,     -- "postal_code", "city"
+  scope_value      VARCHAR(64) NOT NULL,
+
+  buyer_id         INTEGER NOT NULL REFERENCES buyers(id) ON DELETE CASCADE,
+
+  is_active        BOOLEAN NOT NULL DEFAULT true,
+
+  CONSTRAINT offer_exclusivities_scope_type_valid
+    CHECK (scope_type IN ('postal_code','city')),
+  CONSTRAINT offer_exclusivities_unique UNIQUE (offer_id, scope_type, scope_value)
+);
+
+UPDATED: Leads (leads)
+
+Add market/vertical/offer/source binding + idempotency to make “transition” deterministic.
+
+CREATE TABLE leads (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  -- Deterministic classification
+  market_id       INTEGER NOT NULL REFERENCES markets(id) ON DELETE RESTRICT,
+  vertical_id     INTEGER NOT NULL REFERENCES verticals(id) ON DELETE RESTRICT,
+  offer_id        INTEGER NOT NULL REFERENCES offers(id) ON DELETE RESTRICT,
+  source_id       INTEGER NOT NULL REFERENCES sources(id) ON DELETE RESTRICT,
+
+  -- Idempotency (prevents duplicates across retries/reposts)
+  idempotency_key VARCHAR(128), -- provided by client/source or derived (e.g., hash)
+  
+  -- Core lead data (PII)
+  source          VARCHAR(100) NOT NULL DEFAULT 'landing_page',
+  name            VARCHAR(200) NOT NULL,
+  email           VARCHAR(200) NOT NULL,
+  phone           VARCHAR(20) NOT NULL,
+
+  -- Location (generalized)
+  country_code    CHAR(2) NOT NULL DEFAULT 'US',
+  postal_code     VARCHAR(16) NOT NULL,  -- replaces zip
+  city            VARCHAR(128),
+  region_code     VARCHAR(20),           -- e.g., "US-TX"
+  message         TEXT,
+
+  -- State tracking
+  status          lead_status NOT NULL DEFAULT 'received',
+  validation_reason VARCHAR(500),
+
+  -- Buyer relationship
+  buyer_id        INTEGER REFERENCES buyers(id) ON DELETE SET NULL,
+  delivered_at    TIMESTAMPTZ,
+  accepted_at     TIMESTAMPTZ,
+  rejected_at     TIMESTAMPTZ,
+  rejection_reason VARCHAR(500),
+
+  -- Billing lifecycle
+  billing_status  billing_status NOT NULL DEFAULT 'pending',
+  price           DECIMAL(10,2),
+  billed_at       TIMESTAMPTZ,
+  paid_at         TIMESTAMPTZ,
+
+  -- Attribution tracking
+  utm_source      VARCHAR(100),
+  utm_medium      VARCHAR(100),
+  utm_campaign    VARCHAR(100),
+  ip_address      INET,
+  user_agent      TEXT,
+
+  CONSTRAINT leads_idempotency_unique_per_source
+    UNIQUE (source_id, idempotency_key)
+);
+
+UPDATED: Invoices (invoices)
+
+Attach invoices to offer for clean multi-market accounting and reporting.
+
+CREATE TABLE invoices (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  buyer_id        INTEGER NOT NULL REFERENCES buyers(id) ON DELETE CASCADE,
+  offer_id        INTEGER NOT NULL REFERENCES offers(id) ON DELETE RESTRICT,
+
+  period_start    TIMESTAMPTZ NOT NULL,
+  period_end      TIMESTAMPTZ NOT NULL,
+  due_date        TIMESTAMPTZ NOT NULL,
+
+  invoice_number  VARCHAR(50) NOT NULL UNIQUE,
+  status          invoice_status NOT NULL DEFAULT 'draft',
+
+  total_leads     INTEGER NOT NULL DEFAULT 0,
+  amount_due      DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  tax_amount      DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  total_amount    DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+
+  payment_method  payment_method,
+  paid_at         TIMESTAMPTZ,
+  transaction_id  VARCHAR(200),
+
+  disputed_at     TIMESTAMPTZ,
+  dispute_reason  TEXT,
+  resolved_at     TIMESTAMPTZ,
+  resolution_notes TEXT,
+
+  CONSTRAINT check_valid_period CHECK (period_start < period_end),
+  CONSTRAINT check_non_negative_leads CHECK (total_leads >= 0),
+  CONSTRAINT check_non_negative_amount CHECK (amount_due >= 0)
+);
+
+Index Strategy for Performance (UPDATED)
+-- Leads: multi-tenant read patterns (offer/market/vertical + time series)
+CREATE INDEX idx_leads_offer_created_at ON leads(offer_id, created_at DESC);
+CREATE INDEX idx_leads_market_created_at ON leads(market_id, created_at DESC);
+CREATE INDEX idx_leads_vertical_created_at ON leads(vertical_id, created_at DESC);
+CREATE INDEX idx_leads_source_created_at ON leads(source_id, created_at DESC);
+
+CREATE INDEX idx_leads_email ON leads(email);
+CREATE INDEX idx_leads_phone ON leads(phone);
+CREATE INDEX idx_leads_status ON leads(status);
+CREATE INDEX idx_leads_billing_status ON leads(billing_status);
+CREATE INDEX idx_leads_buyer_created_at ON leads(buyer_id, created_at DESC);
+
+-- Duplicate detection (typical: by offer + phone/email + time window)
+CREATE INDEX idx_leads_offer_phone_created ON leads(offer_id, phone, created_at DESC);
+CREATE INDEX idx_leads_offer_email_created ON leads(offer_id, email, created_at DESC);
+
+-- Buyer lookup by offer and priority
+CREATE INDEX idx_buyer_offers_offer_active_priority
+  ON buyer_offers(offer_id, is_active, routing_priority DESC);
+
+-- Buyer service area resolution
+CREATE INDEX idx_buyer_service_areas_market_scope
+  ON buyer_service_areas(market_id, scope_type, scope_value)
+  WHERE is_active = true;
+
+-- Exclusivity lookup
+CREATE INDEX idx_offer_exclusivities_offer_scope
+  ON offer_exclusivities(offer_id, scope_type, scope_value)
+  WHERE is_active = true;
+
+-- Invoices: by buyer + offer + period
+CREATE INDEX idx_invoices_buyer_offer_period
+  ON invoices(buyer_id, offer_id, period_start, period_end);
+
+CREATE INDEX idx_invoices_status_due
+  ON invoices(status, due_date);
+
+CREATE INDEX idx_invoices_paid_at
+  ON invoices(paid_at) WHERE paid_at IS NOT NULL;
+
+API Specification (UPDATED)
+POST /api/leads – Lead Ingestion (UPDATED)
+
+Classification requirement: every lead must resolve to an offer (either explicit identifiers or resolvable source mapping).
+
+Request Body (recommended):
+
+{
+  "source": "landing_page",
+  "source_key": "austin-plumbing-v1", 
+  "idempotency_key": "c1a9d3b2d6c84c2b9b6f9adf4b4e1c1f",
+
+  "name": "John Smith",
+  "email": "john@example.com",
+  "phone": "+15125550123",
+  "country_code": "US",
+  "postal_code": "78701",
+  "message": "Emergency plumbing needed",
+
+  "utm_source": "google",
+  "utm_medium": "cpc",
+  "utm_campaign": "plumbing_austin",
+
+  "consent": true,
+  "gdpr_consent": true
+}
+
+
+Response (202 Accepted):
+
+{
+  "lead_id": 12345,
+  "status": "accepted",
+  "message": "Lead qualified and delivered to buyer",
+  "buyer_id": 7,
+  "offer_id": 12,
+  "price": 45.00
+}
+
+
+Response (400 Bad Request):
+
+{
+  "detail": {
+    "lead_id": 12345,
+    "reason": "Invalid postal_code for offer",
+    "message": "Lead did not pass validation"
+  }
+}
+
+Validation Phase (UPDATED)
+Validation Rules (UPDATED)
+
+All validation rules are derived from the offer’s validation_policy.rules (JSONB), not hardcoded to any one market or niche.
+
+Policy Examples (rules JSONB):
+
+Duplicate window: duplicate_window_hours
+
+Allowed service areas: allowed_postal_codes and/or allowed_cities
+
+Phone validation: phone_region or allowed_country_codes
+
+Field requirements per vertical: required_fields
+
+Disposable email: disposable_email_blocklist_enabled
+
+Optional MX lookup: mx_lookup_enabled
+
+Deterministic flow:
+Lead Data → Load Offer → Load Validation Policy → Execute Plugins → Persist validation_reason on fail → Transition status to validated on success
+
+Routing Phase (UPDATED)
+Buyer Selection Algorithm (UPDATED)
+
+Routing decisions are derived from:
+
+offers.routing_policy_id
+
+buyer_offers (enrollment, priority, caps, per-offer pricing/overrides)
+
+buyer_service_areas (market coverage)
+
+offer_exclusivities (exclusive buyer per scope)
+
+def select_buyer(lead):
+    # 1) Exclusive buyer (offer + scope)
+    exclusive = get_exclusive_buyer(
+        offer_id=lead.offer_id,
+        scope_type="postal_code",
+        scope_value=lead.postal_code,
+    )
+    if exclusive:
+        return exclusive
+
+    # 2) Eligible buyers for offer + market + service area
+    candidates = get_eligible_buyers_for_offer_and_area(
+        offer_id=lead.offer_id,
+        market_id=lead.market_id,
+        postal_code=lead.postal_code,
+        city=lead.city,
+    )
+
+    # 3) Priority + fairness per routing_policy.config
+    return policy_select(candidates, routing_policy_config=load_routing_config(lead.offer_id))
+
+Configuration Management (UPDATED)
+Environment Variables (.env) (UPDATED)
+
+Remove market-specific hardcoding (e.g., ALLOWED_ZIP_PREFIXES). Validation/routing live in DB policies.
+
+# Database
+DATABASE_URL=postgresql+asyncpg://user:pass@postgres:5432/leadgen_db
+DB_POOL_SIZE=20
+DB_MAX_OVERFLOW=40
+
+# Redis
+REDIS_URL=redis://redis:6379/0
+
+# Security
+SECRET_KEY=64-byte-base64-encoded-random-string
+JWT_ALGORITHM=HS256
+ENVIRONMENT=production  # development, staging, production
+
+# Source Resolution (optional)
+# If using deterministic source mapping without hostname/path matching:
+DEFAULT_SOURCE_KEY=
+
+# Email (SMTP) - provider-agnostic
+SMTP_HOST=smtp.yourprovider.com
+SMTP_PORT=587
+SMTP_USER=your_user
+SMTP_PASSWORD=your_password
+FROM_EMAIL=leads@yourdomain.com
+
+# SMS (Twilio)
+TWILIO_ACCOUNT_SID=your_account_sid
+TWILIO_AUTH_TOKEN=your_auth_token
+TWILIO_PHONE_NUMBER=+1234567890
+
+# Webhook Configuration
+WEBHOOK_TIMEOUT_SECONDS=5
+WEBHOOK_MAX_RETRIES=3
+WEBHOOK_RETRY_DELAY=1
+
+# Business Rules (platform-wide defaults only)
+DEFAULT_INVOICE_THRESHOLD=500.00
+DEFAULT_DUPLICATE_WINDOW_HOURS=24
+
+# Logging
+LOG_LEVEL=INFO
+LOG_FORMAT=json
+
+Sections that do NOT need modification to support “seamless transition”
+
+Network architecture diagram (conceptually unchanged)
+
+Webhook payload format (still valid; include offer_id/market_id if desired)
+
+Delivery retry strategy (policy-driven but not market-bound)
+
+Observability, rate limiting, nginx headers (not niche-bound)

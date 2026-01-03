@@ -1,0 +1,372 @@
+The next required update, it is the idempotency contract (exactly when client-provided vs derived keys are accepted, and the database uniqueness scope). The same instructions for this update that applied to upgrades 1 & 2.
+
+Lead Ingestion Idempotency Contract (REQUIRED UPDATE)
+Purpose
+
+Guarantee that retries, duplicate posts, client timeouts, and webhook resubmits do not create duplicate lead rows, do not double-route, and do not double-bill—while remaining compatible with multi-market/multi-vertical “seamless transition”.
+
+Scope
+
+Idempotency is enforced at the Lead Ingestion boundary (POST /api/leads) and is scoped to the resolved source.
+
+Deterministic Rules (Normative)
+R1. Idempotency Key Acceptance
+
+If idempotency_key is provided by the client:
+
+It MUST be accepted if it matches the format rules below.
+
+It MUST be used verbatim after canonicalization.
+
+It MUST be stored on the lead row.
+
+All replays with the same (source_id, idempotency_key) MUST return the same lead result.
+
+If idempotency_key is not provided:
+
+The server MUST derive one deterministically using a canonical function that:
+
+Is stable across restarts and deployments
+
+Is scoped by resolved source_id
+
+Uses fields that materially represent “same lead”
+
+The derived key MUST be stored and treated identically to a client-provided key.
+
+R2. Canonicalization + Validation
+
+Allowed chars: [A-Za-z0-9._:-]
+
+Length: 16–128 characters after canonicalization
+
+Canonicalization: strip() only (do not lowercase or mutate beyond trimming)
+
+If invalid: 400 invalid_idempotency_key_format
+
+R3. Uniqueness and Concurrency
+
+Idempotency MUST be enforced in Postgres with a unique constraint:
+
+UNIQUE (source_id, idempotency_key)
+
+Insertion MUST be concurrency-safe using:
+
+INSERT ... ON CONFLICT (source_id, idempotency_key) DO UPDATE ... RETURNING id
+
+Or DO NOTHING followed by a SELECT, but must be race-safe.
+
+R4. Response Stability
+
+All requests resolving to the same (source_id, idempotency_key) MUST:
+
+Return the same lead_id
+
+Return the same classification fields (source_id, offer_id, market_id, vertical_id)
+
+Preferably return the current processing status (received/validated/delivered/...) and buyer/price if already assigned.
+
+R5. Idempotency vs Duplicate Detection
+
+Idempotency prevents accidental duplicates caused by retries.
+Duplicate detection prevents “same person submitting again” within a window.
+They are separate:
+
+Idempotency key collision = same request replay
+
+Duplicate detection = business rule (may reject or accept depending on policy)
+
+Database Requirements (Normative)
+Leads Table Additions / Constraint (UPDATED)
+ALTER TABLE leads
+  ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128);
+
+-- MUST exist for correctness; unique scoped by source
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'leads_idempotency_unique_per_source'
+  ) THEN
+    ALTER TABLE leads
+      ADD CONSTRAINT leads_idempotency_unique_per_source
+      UNIQUE (source_id, idempotency_key);
+  END IF;
+END $$;
+
+Index for Lookups (RECOMMENDED)
+CREATE INDEX IF NOT EXISTS idx_leads_source_idempotency
+  ON leads(source_id, idempotency_key);
+
+API Contract (Normative)
+Request Fields
+
+idempotency_key (optional, string)
+
+When absent, server derives and returns it (optional to expose) but MUST persist it.
+
+Success Behavior
+
+First request: creates lead row, returns 202 Accepted with lead_id
+
+Replay: returns 202 Accepted with the same lead_id and current known routing/billing fields
+
+Failure Behavior
+
+Invalid format: 400 invalid_idempotency_key_format
+
+Missing required fields needed for derivation (only if key absent): 400 idempotency_derivation_failed
+
+10/10 Reference Implementation (Async SQLAlchemy 2.x + Postgres)
+Notes
+
+Uses a deterministic canonical string → SHA-256 hex.
+
+Uses INSERT ... ON CONFLICT ... DO UPDATE to return the existing id safely.
+
+Does not double-insert under concurrent replay.
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+_IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:-]{16,128}$")
+
+
+class IdempotencyError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def canonicalize_idempotency_key(key: str) -> str:
+    k = key.strip()
+    if not _IDEMPOTENCY_RE.match(k):
+        raise IdempotencyError(
+            code="invalid_idempotency_key_format",
+            message="idempotency_key must match /^[A-Za-z0-9._:-]{16,128}$/ after trimming",
+        )
+    return k
+
+
+def _norm_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def _norm_phone(phone: str) -> str:
+    # Minimal normalization: remove whitespace; do not strip symbols aggressively here unless
+    # your upstream already canonicalizes to E.164.
+    return re.sub(r"\s+", "", phone.strip())
+
+
+def _norm_postal(postal_code: str) -> str:
+    return postal_code.strip().upper()
+
+
+def derive_idempotency_key(
+    *,
+    source_id: int,
+    name: str,
+    email: str,
+    phone: str,
+    country_code: str,
+    postal_code: str,
+    message: Optional[str],
+) -> str:
+    """
+    Deterministic server-side idempotency key derivation.
+
+    Properties:
+    - scoped by source_id
+    - stable across restarts
+    - uses fields that define "same submission"
+    - SHA-256 hex => 64 chars (always valid)
+    """
+    if not email or not phone or not postal_code:
+        raise IdempotencyError(
+            code="idempotency_derivation_failed",
+            message="email, phone, and postal_code are required to derive idempotency_key",
+        )
+
+    parts = [
+        f"source_id={source_id}",
+        f"name={name.strip()}",
+        f"email={_norm_email(email)}",
+        f"phone={_norm_phone(phone)}",
+        f"country={country_code.strip().upper()}",
+        f"postal={_norm_postal(postal_code)}",
+        f"message={(message or '').strip()}",
+    ]
+    payload = "\n".join(parts).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()  # 64 chars, hex
+
+
+@dataclass(frozen=True)
+class LeadInsertResult:
+    lead_id: int
+    created_new: bool
+
+
+async def upsert_lead_stub_idempotent(
+    *,
+    session: AsyncSession,
+    # classification (already resolved)
+    source_id: int,
+    offer_id: int,
+    market_id: int,
+    vertical_id: int,
+    # lead payload
+    source: str,
+    name: str,
+    email: str,
+    phone: str,
+    country_code: str,
+    postal_code: str,
+    city: Optional[str],
+    region_code: Optional[str],
+    message: Optional[str],
+    utm_source: Optional[str],
+    utm_medium: Optional[str],
+    utm_campaign: Optional[str],
+    ip_address: Optional[str],
+    user_agent: Optional[str],
+    # idempotency
+    idempotency_key: Optional[str],
+    now: Optional[datetime] = None,
+) -> LeadInsertResult:
+    """
+    Creates (or reuses) a lead row deterministically keyed by (source_id, idempotency_key).
+
+    This function ONLY establishes the immutable identity row and classification binding.
+    Subsequent phases (validation/routing/billing) MUST operate on lead_id and be idempotent
+    in their own right (status transitions guarded by WHERE clauses / expected state).
+    """
+    if now is None:
+        # Use DB time for authoritative timestamps; this is only used if you want to store updated_at.
+        pass
+
+    if idempotency_key:
+        key = canonicalize_idempotency_key(idempotency_key)
+    else:
+        key = derive_idempotency_key(
+            source_id=source_id,
+            name=name,
+            email=email,
+            phone=phone,
+            country_code=country_code,
+            postal_code=postal_code,
+            message=message,
+        )
+
+    # Concurrency-safe upsert: return the existing lead id if it already exists.
+    # DO UPDATE is a no-op update that allows RETURNING always.
+    row = await session.execute(
+        text(
+            """
+            INSERT INTO leads (
+              created_at,
+              updated_at,
+              market_id,
+              vertical_id,
+              offer_id,
+              source_id,
+              idempotency_key,
+              source,
+              name,
+              email,
+              phone,
+              country_code,
+              postal_code,
+              city,
+              region_code,
+              message,
+              utm_source,
+              utm_medium,
+              utm_campaign,
+              ip_address,
+              user_agent
+            )
+            VALUES (
+              CURRENT_TIMESTAMP,
+              CURRENT_TIMESTAMP,
+              :market_id,
+              :vertical_id,
+              :offer_id,
+              :source_id,
+              :idempotency_key,
+              :source,
+              :name,
+              :email,
+              :phone,
+              :country_code,
+              :postal_code,
+              :city,
+              :region_code,
+              :message,
+              :utm_source,
+              :utm_medium,
+              :utm_campaign,
+              :ip_address,
+              :user_agent
+            )
+            ON CONFLICT (source_id, idempotency_key)
+            DO UPDATE SET
+              updated_at = CURRENT_TIMESTAMP
+            RETURNING
+              id AS lead_id,
+              (xmax = 0) AS created_new
+            """
+        ),
+        {
+            "market_id": market_id,
+            "vertical_id": vertical_id,
+            "offer_id": offer_id,
+            "source_id": source_id,
+            "idempotency_key": key,
+            "source": source,
+            "name": name,
+            "email": email,
+            "phone": phone,
+            "country_code": country_code.strip().upper(),
+            "postal_code": postal_code,
+            "city": city,
+            "region_code": region_code,
+            "message": message,
+            "utm_source": utm_source,
+            "utm_medium": utm_medium,
+            "utm_campaign": utm_campaign,
+            "ip_address": ip_address,
+            "user_agent": user_agent,
+        },
+    )
+    rec = row.mappings().first()
+    if not rec:
+        # Should never happen; indicates a DB-level issue.
+        raise IdempotencyError("idempotency_insert_failed", "Failed to insert or fetch lead row")
+
+    return LeadInsertResult(
+        lead_id=int(rec["lead_id"]),
+        created_new=bool(rec["created_new"]),
+    )
+
+Mandatory Downstream Idempotency (Phase Guards) (Normative)
+
+To prevent double-routing and double-billing when reprocessing the same lead:
+
+Validation transition must be guarded: UPDATE leads SET status='validated' WHERE id=:id AND status='received'
+
+Delivery transition must be guarded: UPDATE leads SET status='delivered', buyer_id=:b WHERE id=:id AND status='validated'
+
+Billing transition must be guarded (you already have this pattern): WHERE billing_status='pending'
+
+These guards ensure that even if your worker picks up the same lead twice, outcomes remain single-commit.

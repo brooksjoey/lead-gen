@@ -1,0 +1,50 @@
+﻿[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true)][string]$AirtableToken,
+  [Parameter(Mandatory = $true)][string]$AirtableBaseId,
+  [Parameter(Mandatory = $true)][string]$CommandsTable,
+  [Parameter(Mandatory = $true)][string]$SpecsTable,
+  [Parameter(Mandatory = $true)][string]$LinkFieldName,
+  [Parameter(Mandatory = $false)][string]$KeyFieldName = "Commands",
+  [Parameter(Mandatory = $false)][string]$InstallDir = "$HOME\airtable-cli"
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+function Test-Command([string]$Name) {
+  if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+    throw "Missing required command: $Name"
+  }
+}
+
+Test-Command "py"
+
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+Set-Location $InstallDir
+
+if (-not (Test-Path ".\.venv")) {
+  py -3.11 -m venv .venv
+}
+& .\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip | Out-Null
+pip install pyairtable python-dotenv | Out-Null
+
+@"
+AIRTABLE_TOKEN=$AirtableToken
+AIRTABLE_BASE_ID=$AirtableBaseId
+
+TABLE_COMMANDS=$CommandsTable
+TABLE_SPECS=$SpecsTable
+
+FIELD_COMMAND_KEY=$KeyFieldName
+FIELD_LINK_TO_SPEC=$LinkFieldName
+"@ | Set-Content -Encoding UTF8 .\.env
+
+@'
+{
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportMissingTypeStubs": "none"
+}
