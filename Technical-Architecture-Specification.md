@@ -179,7 +179,7 @@ CREATE TABLE offers (
   market_id             INTEGER NOT NULL REFERENCES markets(id) ON DELETE RESTRICT,
   vertical_id           INTEGER NOT NULL REFERENCES verticals(id) ON DELETE RESTRICT,
 
-  name                  VARCHAR(200) NOT NULL,           -- e.g., "Emergency Plumbing - Austin"
+  name                  VARCHAR(200) NOT NULL,           -- e.g., "Service Name - Market"
   is_active             BOOLEAN NOT NULL DEFAULT true,
 
   default_price_per_lead DECIMAL(10,2) NOT NULL,
@@ -318,7 +318,7 @@ CREATE TABLE buyer_service_areas (
   market_id       INTEGER NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
 
   scope_type      VARCHAR(16) NOT NULL,     -- "postal_code", "city"
-  scope_value     VARCHAR(64) NOT NULL,     -- e.g., "78701" or "Austin"
+  scope_value     VARCHAR(64) NOT NULL,     -- e.g., "12345" or "City Name"
 
   is_active       BOOLEAN NOT NULL DEFAULT true,
 
@@ -536,74 +536,172 @@ CREATE INDEX idx_invoices_paid_at
   ON invoices(paid_at) WHERE paid_at IS NOT NULL;
 ```
 
-## Lead Ingestion Classification Contract
+## Rule Evaluation Order & Guarantees (Normative)
 
 ### Purpose
 
-Deterministically resolve every inbound lead to exactly one `sources.id` and therefore exactly one `offers.id` (and its `market_id` and `vertical_id`) with no hardcoded market/niche logic.
+Guarantee that market/vertical specificity is expressed **only** through configuration (`offers`, `sources`, `validation_policies.rules`, `routing_policies.config`) and never through hardcoded conditionals in code.
+
+### Non-Negotiable Guarantee
+
+The platform MUST NOT contain any market- or vertical-specific logic hardcoded in application code, including but not limited to:
+
+* ZIP/prefix/regex checks (`^787`)
+* "Texas area codes"
+* city allowlists
+* "plumber" assumptions
+* business-hours assumptions
+
+All such behavior MUST be expressed via policy configuration and reference data.
+
+### Normative Pipeline Order (Required)
+
+For every inbound lead, the processing order MUST be:
+
+1. **Classification (Source Resolution)**
+   Resolve exactly one `source_id` and bind `offer_id`, `market_id`, `vertical_id`.
+2. **Idempotent Lead Row Creation**
+   Upsert lead row using `(source_id, idempotency_key)` uniqueness.
+3. **Duplicate Detection (Policy-Driven)**
+   Evaluate duplicates based on `validation_policies.rules.duplicate_detection`.
+   Execute **after** classification + idempotent row creation, **before** validation/routing. 
+4. **Validation (Policy-Driven)**
+   Evaluate required fields and qualification constraints using `validation_policies.rules`.
+5. **Routing (Policy-Driven)**
+   Select buyer according to `routing_policies.config` and buyer scoping tables.
+6. **Delivery**
+   Deliver to selected buyer.
+7. **Billing (Per-Offer / Immutable)**
+   Compute and persist price at delivery time; prevent double-billing via guarded transitions.
+
+### Required Transition Guards (Normative)
+
+To prevent double-processing (retries, replays, worker duplication), state transitions MUST be guarded:
+
+* Validation transition guard:
+  `UPDATE leads SET status='validated' WHERE id=:id AND status='received'`
+* Delivery transition guard:
+  `UPDATE leads SET status='delivered', buyer_id=:b WHERE id=:id AND status='validated'`
+* Billing transition guard:
+  `UPDATE ... WHERE billing_status='pending'`
+
+(These are mandatory downstream idempotency phase guards.) 
+
+## Lead Ingestion Classification Contract (Normative)
+
+### Purpose
+
+Deterministically resolve every inbound lead to exactly one `sources.id` and therefore exactly one `offers.id` (and its `market_id` and `vertical_id`) with no hardcoded market/niche logic. 
 
 ### Guarantees
 
-- **Deterministic**: identical request inputs resolve to the same `sources.id`.
-- **Unambiguous**: resolution either yields exactly one source or fails with a classified error.
-- **Stable**: changing routing/validation does not change source resolution.
-- **Config-driven**: adding markets/verticals/offers/sources requires only DB inserts/updates.
+* **Deterministic:** identical request inputs resolve to the same `sources.id`.
+* **Unambiguous:** resolution yields exactly one source or fails with a classified error.
+* **Stable:** changing routing/validation does not change source resolution.
+* **Config-driven:** adding markets/verticals/offers/sources requires only DB inserts/updates. 
 
-### Resolution Inputs
+### Data Model Requirements (Sources) (Normative)
 
-**Accepted Identification Inputs (in priority order):**
+```sql
+CREATE TABLE sources (
+  id              SERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMPTZ,
+
+  offer_id         INTEGER NOT NULL REFERENCES offers(id) ON DELETE RESTRICT,
+
+  -- Stable, human-manageable identifier used by landing pages / integrations
+  source_key      VARCHAR(128) NOT NULL,
+
+  kind            VARCHAR(32) NOT NULL,         -- "landing_page", "partner_api", "embed_form"
+  name            VARCHAR(200) NOT NULL,        -- display label
+
+  -- Deterministic HTTP mapping fields (optional; used when source_key not provided)
+  hostname        VARCHAR(255),                 -- exact match on lower(hostname)
+  path_prefix     VARCHAR(255),                 -- normalized prefix, must start with "/"
+
+  -- Optional auth for programmatic ingestion (store hash, never plaintext)
+  api_key_hash    VARCHAR(255),
+
+  is_active       BOOLEAN NOT NULL DEFAULT true,
+
+  CONSTRAINT sources_source_key_unique UNIQUE (source_key),
+  CONSTRAINT sources_kind_valid CHECK (kind IN ('landing_page','partner_api','embed_form')),
+  CONSTRAINT sources_path_prefix_format CHECK (path_prefix IS NULL OR path_prefix ~ '^/'),
+  CONSTRAINT sources_http_mapping_requires_hostname CHECK (
+    (path_prefix IS NULL AND hostname IS NULL) OR (hostname IS NOT NULL)
+  )
+);
+```
+
+
+
+### Required Indexes (Sources) (Normative)
+
+```sql
+CREATE INDEX idx_sources_offer_id ON sources(offer_id);
+CREATE INDEX idx_sources_active_key ON sources(is_active, source_key);
+
+-- HTTP mapping lookup (exact hostname; then longest-prefix match)
+CREATE INDEX idx_sources_active_hostname ON sources(is_active, hostname);
+CREATE INDEX idx_sources_active_hostname_prefix ON sources(is_active, hostname, path_prefix);
+```
+
+
+
+### Resolution Inputs (Priority Order) (Normative)
+
+Accepted identification inputs, in priority order:
 
 1. `source_id` (header or body): direct numeric ID (admin/internal only)
 2. `source_key` (body): stable string identifier
-3. **HTTP mapping**: request Host + request Path using `sources.hostname` + `sources.path_prefix`
+3. HTTP mapping: request Host + request Path using `sources.hostname` + `sources.path_prefix` 
 
-### Canonicalization Rules
+### Canonicalization Rules (Normative)
 
-- **source_key**: `strip()`; must match `[A-Za-z0-9][A-Za-z0-9._:-]{1,127}` (2–128 chars)
-- **hostname**: lower-case; strip port; if missing Host header → fail
-- **path**: must start with `/`; if empty → `/`
+* `source_key`: `strip()`; must match `[A-Za-z0-9][A-Za-z0-9._:-]{1,127}` (2–128 chars)
+* `hostname`: lower-case; strip port; if missing Host header → fail
+* `path`: must start with `/`; if empty → `/` 
 
 ### Deterministic Resolution Algorithm (Normative)
 
-#### Priority 1: source_id (Direct)
+**Priority 1: `source_id`**
 
-If `source_id` is provided:
+* If provided: select active source by `id`.
+* If not found → `400 invalid_source`
+* If found → bind `offer_id`, `market_id`, `vertical_id`
 
-- SELECT source by id AND `is_active = true`
-- If not found → 400 `invalid_source`
-- If found → accept and bind `offer_id`
+**Priority 2: `source_key`**
 
-#### Priority 2: source_key (Stable External ID)
+* If provided: select active source by `source_key`.
+* If not found → `400 invalid_source_key`
+* If found → bind `offer_id`, `market_id`, `vertical_id`
 
-If `source_key` is provided:
+**Priority 3: HTTP Mapping (Host + Longest Path Prefix)**
 
-- SELECT source by `source_key` AND `is_active = true`
-- If not found → 400 `invalid_source_key`
-- If found → accept and bind `offer_id`
+* If neither `source_id` nor `source_key` is provided:
 
-#### Priority 3: HTTP Mapping (Host + Longest Path Prefix)
+  * resolve `hostname = lower(strip_port(request.host))`
+  * resolve `path = normalized request path`
+  * query active sources with matching hostname and:
 
-If neither `source_id` nor `source_key` is provided:
+    * `path_prefix IS NULL` OR `path LIKE path_prefix || '%'`
+  * choose single best match:
 
-1. Resolve `hostname = lower(strip_port(request.host))`
-2. Resolve `path = request.url.path` (normalized)
-3. Query all active sources with matching hostname and (NULL prefix OR prefix match)
-4. Choose single best match:
-   - Prefer the row with the longest `path_prefix` satisfying `path LIKE path_prefix || '%'`
-   - If multiple rows tie for longest prefix → 409 `ambiguous_source_mapping`
-   - If none found → 400 `unmapped_source`
+    * prefer row with **longest** `path_prefix`
+    * if multiple rows tie for longest prefix → `409 ambiguous_source_mapping`
+    * if none found → `400 unmapped_source` 
 
-### Invariants
+### Invariants (Normative)
 
-- A resolved `sources.id` implies exactly one `offers.id` via `sources.offer_id`.
-- `offers.id` implies `market_id` and `vertical_id` as the system-of-record for classification.
-- Lead insertion MUST store `source_id`, `offer_id`, `market_id`, `vertical_id` exactly as resolved.
+* A resolved `sources.id` implies exactly one `offers.id` via `sources.offer_id`.
+* `offers.id` implies `market_id` and `vertical_id` as system-of-record classification.
+* Lead insertion MUST store `source_id`, `offer_id`, `market_id`, `vertical_id` exactly as resolved. 
 
 ### Reference SQL (Normative)
 
-**Resolve by source_key:**
-
 ```sql
+-- Resolve by source_key
 SELECT
   s.id            AS source_id,
   s.offer_id      AS offer_id,
@@ -614,11 +712,8 @@ JOIN offers o ON o.id = s.offer_id
 WHERE s.is_active = true
   AND s.source_key = :source_key
 LIMIT 1;
-```
 
-**Resolve by hostname + longest path_prefix:**
-
-```sql
+-- Resolve by hostname + longest path_prefix
 WITH candidates AS (
   SELECT
     s.id            AS source_id,
@@ -646,247 +741,128 @@ FROM ranked
 LIMIT 2;
 ```
 
-**Interpretation rule:**
+Interpretation:
 
-- 0 rows → unmapped
-- 1 row → resolved
-- 2 rows where `prefix_len` equal → ambiguous (fail)
-- 2 rows where `prefix_len` differs → take first (longest prefix)
+* 0 rows → unmapped
+* 1 row → resolved
+* 2 rows where `prefix_len` equal → ambiguous (fail)
+* 2 rows where `prefix_len` differs → take first (longest prefix) 
 
-### Reference Implementation (Async SQLAlchemy 2.x)
+## Lead Ingestion Idempotency Contract (Normative)
 
-```python
-from __future__ import annotations
+### Purpose
 
-import hashlib
-import re
-from dataclasses import dataclass
-from typing import Optional, Tuple
+Guarantee that retries, duplicate posts, client timeouts, and webhook resubmits do not create duplicate lead rows, do not double-route, and do not double-bill—while remaining compatible with multi-market/multi-vertical seamless transition. 
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.requests import Request
+### Scope
 
+Idempotency is enforced at the Lead Ingestion boundary (`POST /api/leads`) and is scoped to the resolved source. 
 
-_SOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$")
+### Deterministic Rules (Normative)
 
+#### R1. Idempotency Key Acceptance
 
-class SourceResolutionError(Exception):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
+If `idempotency_key` is provided by the client:
 
+* MUST be accepted if it matches format rules
+* MUST be used verbatim after canonicalization
+* MUST be stored on the lead row
+* All replays with same `(source_id, idempotency_key)` MUST return the same lead result 
 
-@dataclass(frozen=True)
-class ResolvedClassification:
-    source_id: int
-    offer_id: int
-    market_id: int
-    vertical_id: int
+If `idempotency_key` is not provided:
 
+* Server MUST derive deterministically:
 
-def _strip_port(host: str) -> str:
-    host = host.strip()
-    if not host:
-        return host
-    # IPv6 in brackets: [::1]:8000
-    if host.startswith("["):
-        end = host.find("]")
-        if end != -1:
-            return host[: end + 1].lower()
-        return host.lower()
-    # hostname:port
-    if ":" in host:
-        return host.split(":", 1)[0].lower()
-    return host.lower()
+  * stable across restarts/deployments
+  * scoped by resolved `source_id`
+  * uses fields that materially represent "same lead"
+* Derived key MUST be stored and treated identically to a client-provided key 
 
+#### R2. Canonicalization + Validation
 
-def _normalize_path(path: str) -> str:
-    if not path:
-        return "/"
-    if not path.startswith("/"):
-        path = "/" + path
-    return path
+* Allowed chars: `[A-Za-z0-9._:-]`
+* Length: 16–128 after canonicalization
+* Canonicalization: `strip()` only
+* If invalid: `400 invalid_idempotency_key_format` 
 
+#### R3. Uniqueness and Concurrency
 
-def _validate_source_key(source_key: str) -> str:
-    source_key = source_key.strip()
-    if not _SOURCE_KEY_RE.match(source_key):
-        raise SourceResolutionError(
-            code="invalid_source_key_format",
-            message="source_key must match /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/",
-        )
-    return source_key
+Idempotency MUST be enforced in Postgres:
 
-
-def derive_idempotency_key(
-    *,
-    source_id: int,
-    email: str,
-    phone: str,
-    postal_code: str,
-    message: Optional[str],
-) -> str:
-    # Deterministic fallback when client does not provide idempotency_key.
-    # Scoped by source_id so distinct sources do not collide.
-    parts = [
-        str(source_id),
-        email.strip().lower(),
-        re.sub(r"\s+", "", phone.strip()),
-        postal_code.strip().upper(),
-        (message or "").strip(),
-    ]
-    raw = "\n".join(parts).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-async def resolve_classification(
-    *,
-    session: AsyncSession,
-    request: Request,
-    source_id: Optional[int],
-    source_key: Optional[str],
-) -> ResolvedClassification:
-    # Priority 1: direct source_id (internal/admin)
-    if source_id is not None:
-        row = await session.execute(
-            text(
-                """
-                SELECT
-                  s.id        AS source_id,
-                  s.offer_id  AS offer_id,
-                  o.market_id AS market_id,
-                  o.vertical_id AS vertical_id
-                FROM sources s
-                JOIN offers o ON o.id = s.offer_id
-                WHERE s.is_active = true
-                  AND s.id = :source_id
-                LIMIT 1
-                """
-            ),
-            {"source_id": int(source_id)},
-        )
-        rec = row.mappings().first()
-        if not rec:
-            raise SourceResolutionError("invalid_source", "source_id not found or inactive")
-        return ResolvedClassification(
-            source_id=int(rec["source_id"]),
-            offer_id=int(rec["offer_id"]),
-            market_id=int(rec["market_id"]),
-            vertical_id=int(rec["vertical_id"]),
-        )
-
-    # Priority 2: source_key (stable external)
-    if source_key:
-        sk = _validate_source_key(source_key)
-        row = await session.execute(
-            text(
-                """
-                SELECT
-                  s.id        AS source_id,
-                  s.offer_id  AS offer_id,
-                  o.market_id AS market_id,
-                  o.vertical_id AS vertical_id
-                FROM sources s
-                JOIN offers o ON o.id = s.offer_id
-                WHERE s.is_active = true
-                  AND s.source_key = :source_key
-                LIMIT 1
-                """
-            ),
-            {"source_key": sk},
-        )
-        rec = row.mappings().first()
-        if not rec:
-            raise SourceResolutionError("invalid_source_key", "source_key not found or inactive")
-        return ResolvedClassification(
-            source_id=int(rec["source_id"]),
-            offer_id=int(rec["offer_id"]),
-            market_id=int(rec["market_id"]),
-            vertical_id=int(rec["vertical_id"]),
-        )
-
-    # Priority 3: HTTP mapping (Host + longest prefix)
-    host = request.headers.get("host", "").strip()
-    hostname = _strip_port(host)
-    if not hostname:
-        raise SourceResolutionError("missing_host_header", "Host header is required for source mapping")
-
-    path = _normalize_path(request.url.path)
-
-    row = await session.execute(
-        text(
-            """
-            WITH candidates AS (
-              SELECT
-                s.id            AS source_id,
-                s.offer_id      AS offer_id,
-                o.market_id     AS market_id,
-                o.vertical_id   AS vertical_id,
-                s.path_prefix   AS path_prefix,
-                LENGTH(COALESCE(s.path_prefix, '')) AS prefix_len
-              FROM sources s
-              JOIN offers o ON o.id = s.offer_id
-              WHERE s.is_active = true
-                AND s.hostname = :hostname
-                AND (
-                  s.path_prefix IS NULL
-                  OR :path LIKE s.path_prefix || '%'
-                )
-            ),
-            ranked AS (
-              SELECT *
-              FROM candidates
-              ORDER BY prefix_len DESC, source_id ASC
-            )
-            SELECT *
-            FROM ranked
-            LIMIT 2
-            """
-        ),
-        {"hostname": hostname, "path": path},
-    )
-    recs = list(row.mappings().all())
-
-    if not recs:
-        raise SourceResolutionError("unmapped_source", "No active source matched hostname/path")
-
-    if len(recs) == 1:
-        rec = recs[0]
-        return ResolvedClassification(
-            source_id=int(rec["source_id"]),
-            offer_id=int(rec["offer_id"]),
-            market_id=int(rec["market_id"]),
-            vertical_id=int(rec["vertical_id"]),
-        )
-
-    # Two candidates returned: verify ambiguity rules.
-    first, second = recs[0], recs[1]
-    if int(first["prefix_len"]) == int(second["prefix_len"]):
-        raise SourceResolutionError(
-            "ambiguous_source_mapping",
-            "Multiple sources matched with equal specificity (path_prefix length)",
-        )
-
-    return ResolvedClassification(
-        source_id=int(first["source_id"]),
-        offer_id=int(first["offer_id"]),
-        market_id=int(first["market_id"]),
-        vertical_id=int(first["vertical_id"]),
-    )
+```sql
+UNIQUE (source_id, idempotency_key)
 ```
 
-### Operational Rules (Non-Negotiable for Seamless Transition)
+Insertion MUST be concurrency-safe:
 
-Every new landing page/integration must be provisioned with:
+```sql
+INSERT ... ON CONFLICT (source_id, idempotency_key) DO UPDATE ... RETURNING id
+```
 
-- `sources.source_key` (recommended) and/or `hostname` + `path_prefix`
-- `sources.offer_id` pointing to the intended `offers.id`
+(or race-safe `DO NOTHING` + select). 
 
-Any time two sources share the same hostname, `path_prefix` MUST be unique and non-overlapping by length tie to avoid ambiguity.
+#### R4. Response Stability
 
-If you rely on HTTP mapping, use distinct path prefixes per offer (e.g., `/lp/plumbing/`, `/lp/roofing/`) and avoid shared roots like `/`.
+All requests resolving to the same `(source_id, idempotency_key)` MUST:
+
+* return the same `lead_id`
+* return the same classification fields (`source_id`, `offer_id`, `market_id`, `vertical_id`)
+* preferably return current processing status and buyer/price if already assigned 
+
+#### R5. Idempotency vs Duplicate Detection
+
+* Idempotency prevents accidental duplicates caused by retries.
+* Duplicate detection prevents "same person submitting again" within a window.
+* They are separate:
+
+  * idempotency key collision = same request replay
+  * duplicate detection = business rule (reject/flag/accept depending on policy) 
+
+### Database Requirements (Normative)
+
+```sql
+ALTER TABLE leads
+  ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'leads_idempotency_unique_per_source'
+  ) THEN
+    ALTER TABLE leads
+      ADD CONSTRAINT leads_idempotency_unique_per_source
+      UNIQUE (source_id, idempotency_key);
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_leads_source_idempotency
+  ON leads(source_id, idempotency_key);
+```
+
+
+
+### API Contract (Normative)
+
+* Request field: `idempotency_key` (optional string)
+* When absent: server derives (may return it) but MUST persist
+* Success:
+
+  * first request: creates lead row, returns `202 Accepted` with `lead_id`
+  * replay: returns `202 Accepted` with same `lead_id` and current known routing/billing fields
+* Failure:
+
+  * invalid format: `400 invalid_idempotency_key_format`
+  * missing required fields for derivation (only if key absent): `400 idempotency_derivation_failed` 
+
+### Mandatory Downstream Idempotency (Phase Guards) (Normative)
+
+To prevent double-routing and double-billing when reprocessing the same lead:
+
+* Validation transition must be guarded: `UPDATE ... WHERE status='received'`
+* Delivery transition must be guarded: `UPDATE ... WHERE status='validated'`
+* Billing transition must be guarded: `UPDATE ... WHERE billing_status='pending'` 
 
 ## Lead Ingestion Idempotency Contract
 
@@ -1231,6 +1207,192 @@ To prevent double-routing and double-billing when reprocessing the same lead:
 - **Billing transition** must be guarded (you already have this pattern): `WHERE billing_status='pending'`
 
 These guards ensure that even if your worker picks up the same lead twice, outcomes remain single-commit.
+
+## Duplicate Detection Contract (Normative)
+
+### Purpose
+
+Prevent low-quality "repeat submissions" from being treated as new leads while preserving correct behavior for:
+
+* multi-market / multi-vertical offers
+* source-scoped idempotency
+* configurable per-offer windows and rules
+* concurrency-safe ingestion 
+
+### Definitions
+
+* **Idempotency:** same request replay → same `(source_id, idempotency_key)` → same lead row.
+* **Duplicate detection:** different request (new idempotency key) but materially the same lead within a configured window → policy-driven outcome (reject, flag, accept). 
+
+### Scope
+
+Duplicate detection is executed during ingestion **after** classification + idempotent lead row creation, and before validation/routing transitions. 
+
+### Normative Policy Inputs (from `validation_policies.rules`)
+
+`validation_policies.rules` MUST support:
+
+```json
+{
+  "duplicate_detection": {
+    "enabled": true,
+    "window_hours": 24,
+    "scope": "offer",
+    "keys": ["phone", "email"],
+    "match_mode": "any",
+    "exclude_statuses": ["rejected"],
+    "include_sources": "any",
+    "action": "reject",
+    "reason_code": "duplicate_recent",
+    "min_fields": ["phone"],
+    "normalize": {
+      "email": "lower_trim",
+      "phone": "e164_or_digits",
+      "postal_code": "upper_trim"
+    }
+  }
+}
+```
+
+
+
+### Semantics (Normative)
+
+* `enabled`: if false/missing → skip duplicate detection
+* `window_hours`: lookback window
+* `scope`: `"offer"` (required); must be scoped at least to `offer_id`
+* `keys`: subset of `["phone","email"]` (required)
+* `match_mode`:
+
+  * `"any"`: duplicate if any key matches within window
+  * `"all"`: duplicate if all configured keys match (requires presence of all keys)
+* `exclude_statuses`: ignore prior leads with these statuses
+* `include_sources`:
+
+  * `"any"`: match across all sources within the offer
+  * `"same_source_only"`: match only within same `source_id`
+* `action`:
+
+  * `"reject"`: set status `rejected` with reason and stop pipeline
+  * `"flag"`: continue but mark duplicate + record reference
+  * `"accept"`: record reference, no behavior change
+* `min_fields`: required fields to run check; if missing → skip
+* `normalize`: canonicalization strategy 
+
+### Required Schema Additions (Normative)
+
+```sql
+ALTER TABLE leads
+  ADD COLUMN IF NOT EXISTS normalized_email VARCHAR(320),
+  ADD COLUMN IF NOT EXISTS normalized_phone VARCHAR(32),
+  ADD COLUMN IF NOT EXISTS duplicate_of_lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS is_duplicate BOOLEAN NOT NULL DEFAULT false;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'leads_normalized_phone_len') THEN
+    ALTER TABLE leads
+      ADD CONSTRAINT leads_normalized_phone_len
+      CHECK (normalized_phone IS NULL OR LENGTH(normalized_phone) BETWEEN 7 AND 32);
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'leads_normalized_email_len') THEN
+    ALTER TABLE leads
+      ADD CONSTRAINT leads_normalized_email_len
+      CHECK (normalized_email IS NULL OR LENGTH(normalized_email) BETWEEN 3 AND 320);
+  END IF;
+END $$;
+```
+
+
+
+### Optional Audit Table (Normative-Optional)
+
+```sql
+CREATE TABLE IF NOT EXISTS lead_duplicate_events (
+  id                BIGSERIAL PRIMARY KEY,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  lead_id           INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  matched_lead_id   INTEGER NOT NULL REFERENCES leads(id) ON DELETE RESTRICT,
+
+  offer_id          INTEGER NOT NULL REFERENCES offers(id) ON DELETE RESTRICT,
+  source_id         INTEGER NOT NULL REFERENCES sources(id) ON DELETE RESTRICT,
+
+  match_keys        TEXT[] NOT NULL,
+  window_hours      INTEGER NOT NULL,
+  match_mode        VARCHAR(8) NOT NULL,
+  include_sources   VARCHAR(16) NOT NULL,
+
+  action            VARCHAR(8) NOT NULL,
+  reason_code       VARCHAR(64) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lde_lead_id ON lead_duplicate_events(lead_id);
+CREATE INDEX IF NOT EXISTS idx_lde_offer_created_at ON lead_duplicate_events(offer_id, created_at DESC);
+```
+
+
+
+### Index Design (Normative)
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_leads_offer_norm_phone_created
+  ON leads(offer_id, normalized_phone, created_at DESC)
+  WHERE normalized_phone IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_leads_offer_norm_email_created
+  ON leads(offer_id, normalized_email, created_at DESC)
+  WHERE normalized_email IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_leads_offer_source_norm_phone_created
+  ON leads(offer_id, source_id, normalized_phone, created_at DESC)
+  WHERE normalized_phone IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_leads_offer_source_norm_email_created
+  ON leads(offer_id, source_id, normalized_email, created_at DESC)
+  WHERE normalized_email IS NOT NULL;
+```
+
+
+
+### Normalization Strategy (Normative)
+
+* Email (`lower_trim`): trim + lowercase; empty → NULL
+* Phone (`e164_or_digits`):
+
+  * if E.164: keep
+  * else strip non-digits
+  * if result length < 7 → NULL 
+
+### Duplicate Detection Algorithm (Normative)
+
+Required inputs:
+
+* resolved classification: `offer_id`, `source_id`
+* persisted lead row: `lead_id`, `created_at`
+* policy: `validation_policies.rules.duplicate_detection`
+
+Output one of:
+
+* `not_duplicate`
+* `duplicate_reject(matched_lead_id)`
+* `duplicate_flag(matched_lead_id)`
+* `duplicate_accept(matched_lead_id)`
+
+Matching rules:
+
+* window: prior leads where `created_at >= now() - window_hours`
+* exclusions: ignore prior leads with status in `exclude_statuses`
+* scope: always `offer_id = :offer_id`
+* sources:
+
+  * `any`: ignore `source_id`
+  * `same_source_only`: require `source_id = :source_id`
+* match keys:
+
+  * `any`: either phone or email matches
+  * `all`: both match (and both present) 
 
 ## Duplicate Detection Contract
 
@@ -1766,19 +1928,19 @@ Classification requirement: every lead must resolve to an offer (either explicit
 ```json
 {
   "source": "landing_page",
-  "source_key": "austin-plumbing-v1", 
+  "source_key": "market-vertical-v1", 
   "idempotency_key": "c1a9d3b2d6c84c2b9b6f9adf4b4e1c1f",
 
   "name": "John Smith",
   "email": "john@example.com",
   "phone": "+15125550123",
   "country_code": "US",
-  "postal_code": "78701",
-  "message": "Emergency plumbing needed",
+  "postal_code": "12345",
+  "message": "Service inquiry",
 
   "utm_source": "google",
   "utm_medium": "cpc",
-  "utm_campaign": "plumbing_austin",
+  "utm_campaign": "service_market",
 
   "consent": true,
   "gdpr_consent": true
@@ -1884,15 +2046,19 @@ Classification requirement: every lead must resolve to an offer (either explicit
       "name": "John Smith",
       "phone": "+15125550123",
       "email": "john@example.com",
-      "zip": "78701"
+      "postal_code": "12345"
     },
     "details": {
-      "message": "Emergency plumbing needed",
+      "message": "Service inquiry",
       "source": "landing_page"
     },
     "metadata": {
       "price": 45.00,
-      "buyer_id": 7
+      "buyer_id": 7,
+      "source_id": 31,
+      "offer_id": 12,
+      "market_id": 4,
+      "vertical_id": 2
     }
   }
 }
@@ -2381,7 +2547,7 @@ EVENT_TYPES = {
 VALIDATION_PLUGINS = [
     'email_validation',
     'phone_validation', 
-    'zip_validation',
+    'postal_code_validation',
     'duplicate_detection',
     'fraud_detection',  # Future
     'lead_scoring',     # Future
@@ -2391,7 +2557,7 @@ VALIDATION_PLUGINS = [
 ROUTING_STRATEGIES = {
     'priority_based': 'Default priority system',
     'round_robin': 'Even distribution',
-    'exclusive_zip': 'ZIP code exclusivity',
+    'exclusive_scope': 'Offer-based exclusivity (postal_code/city)',
     'capacity_based': 'Based on buyer capacity',
     'performance_based': 'Based on historical conversion',
 }
@@ -2420,8 +2586,6 @@ ROUTING_STRATEGIES = {
 - **Real-time Analytics**: Use a time-series database (e.g., TimescaleDB) for metrics.
 
 - **Machine Learning**: Add lead scoring and fraud detection models.
-
-- **Multi-tenancy**: Support multiple cities and service verticals.
 
 - **API Versioning**: Implement semantic versioning with a deprecation schedule.
 
@@ -2542,6 +2706,18 @@ Key Architectural Changes (Multi-Market/Vertical Support):
 - **Atomicity**: Database transactions that succeed or fail completely
 
 - **Idempotency Key**: Unique identifier to prevent duplicate processing
+
+- **Market**: A geographic region (e.g., "Austin, TX", "Tampa, FL") with timezone and currency settings
+
+- **Vertical**: A service category (e.g., "plumbing", "roofing") that defines the type of service offered
+
+- **Offer**: A canonical unit of sale combining a vertical in a market, with attached validation and routing policies
+
+- **Source**: A lead origin point (landing page, API partner, form embed) mapped to an offer for deterministic classification
+
+- **Duplicate Detection**: Business rule that prevents "same person submitting again" within a configured window, separate from idempotency
+
+- **Classification**: The deterministic process of resolving a lead to exactly one source, offer, market, and vertical
 
 This technical specification serves as the single source of truth for the system's architecture, implementation details, and operational procedures. All technical decisions, configurations, and extensions should reference this document for consistency and maintainability.
 
