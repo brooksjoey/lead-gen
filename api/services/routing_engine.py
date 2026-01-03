@@ -1,418 +1,550 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
-from sqlalchemy import text
+from sqlalchemy import text, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from redis.asyncio import Redis
 
+from .logging import get_logger
+
+logger = get_logger(__name__)
+
+class RoutingStrategy(Enum):
+    PRIORITY = "priority"
+    ROUND_ROBIN = "round_robin"
+    CAPACITY_WEIGHTED = "capacity_weighted"
+    PERFORMANCE_BASED = "performance_based"
+    EXCLUSIVE = "exclusive"
 
 class RoutingError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, details: Optional[Dict] = None):
         super().__init__(message)
         self.code = code
         self.message = message
-
+        self.details = details or {}
 
 @dataclass(frozen=True)
 class RoutingPolicy:
     id: int
     name: str
     version: int
+    strategy: RoutingStrategy
     config: Dict[str, Any]
-    is_active: bool
+    fallback_strategy: Optional[RoutingStrategy] = None
+    is_active: bool = True
 
+@dataclass(frozen=True)
+class BuyerCapacity:
+    daily_used: int
+    daily_limit: Optional[int]
+    hourly_used: int
+    hourly_limit: Optional[int]
+    is_capped: bool
 
 @dataclass(frozen=True)
 class EligibleBuyer:
     buyer_id: int
     routing_priority: int
-    price_per_lead: Optional[float]
-    capacity_per_day: Optional[int]
-    capacity_per_hour: Optional[int]
-
+    price_per_lead: float
+    capacity: BuyerCapacity
+    performance_score: Optional[float] = None
+    last_assigned: Optional[datetime] = None
 
 @dataclass(frozen=True)
 class RoutingResult:
     buyer_id: Optional[int]
+    price: Optional[float]
+    routing_policy_id: int
+    strategy_used: RoutingStrategy
+    execution_time_ms: float
+    cache_hit: bool = False
     no_route_reason: Optional[str] = None
+    warnings: List[str] = None
+    
+    def __post_init__(self):
+        if self.warnings is None:
+            self.warnings = []
 
-
-async def load_routing_policy(
-    *, session: AsyncSession, offer_id: int
-) -> RoutingPolicy:
-    """
-    Load routing policy for an offer.
-    """
-    row = await session.execute(
-        text(
-            """
-            SELECT
-              rp.id,
-              rp.name,
-              rp.version,
-              rp.config,
-              rp.is_active
-            FROM offers o
-            JOIN routing_policies rp ON rp.id = o.routing_policy_id
-            WHERE o.id = :offer_id
-              AND rp.is_active = true
-            LIMIT 1
-            """
-        ),
-        {"offer_id": offer_id},
-    )
-    rec = row.mappings().first()
-    if not rec:
-        raise RoutingError(
-            code="routing_policy_not_found",
-            message=f"Routing policy not found for offer_id={offer_id}",
-        )
-
-    config = rec["config"]
-    if not isinstance(config, dict):
-        raise RoutingError(
-            code="invalid_routing_policy",
-            message=f"Routing policy config must be a JSON object, got {type(config)}",
-        )
-
-    return RoutingPolicy(
-        id=int(rec["id"]),
-        name=str(rec["name"]),
-        version=int(rec["version"]),
-        config=config,
-        is_active=bool(rec["is_active"]),
-    )
-
-
-async def get_exclusive_buyer(
-    *,
-    session: AsyncSession,
-    offer_id: int,
-    scope_type: str,
-    scope_value: str,
-) -> Optional[int]:
-    """
-    Check for exclusive buyer for offer + scope.
-    Returns buyer_id if exclusive buyer exists and is active, None otherwise.
-    """
-    row = await session.execute(
-        text(
-            """
-            SELECT oe.buyer_id
-            FROM offer_exclusivities oe
-            JOIN buyers b ON b.id = oe.buyer_id
-            WHERE oe.offer_id = :offer_id
-              AND oe.scope_type = :scope_type
-              AND oe.scope_value = :scope_value
-              AND oe.is_active = true
-              AND b.is_active = true
-            LIMIT 1
-            """
-        ),
-        {
-            "offer_id": offer_id,
-            "scope_type": scope_type,
-            "scope_value": scope_value,
-        },
-    )
-    rec = row.mappings().first()
-    if rec:
-        return int(rec["buyer_id"])
-    return None
-
-
-async def get_eligible_buyers(
-    *,
-    session: AsyncSession,
-    offer_id: int,
-    market_id: int,
-    postal_code: Optional[str],
-    city: Optional[str],
-) -> List[EligibleBuyer]:
-    """
-    Get eligible buyers for offer + market + service area.
-    Eligibility criteria:
-    - buyer_offers enrollment for offer_id (is_active = true)
-    - buyer_service_areas coverage for market_id (is_active = true)
-    - buyer is_active = true
-    - buyer not paused (pause_until IS NULL OR pause_until < NOW)
-    - buyer satisfies capacity constraints if configured
-    """
-    # Build service area match conditions
-    service_area_conditions = []
-    service_area_params = {
-        "offer_id": offer_id,
-        "market_id": market_id,
-    }
-
-    if postal_code:
-        service_area_conditions.append(
-            "(bsa.scope_type = 'postal_code' AND bsa.scope_value = :postal_code)"
-        )
-        service_area_params["postal_code"] = postal_code
-
-    if city:
-        service_area_conditions.append(
-            "(bsa.scope_type = 'city' AND bsa.scope_value = :city)"
-        )
-        service_area_params["city"] = city
-
-    if not service_area_conditions:
-        return []
-
-    service_area_match = " OR ".join(service_area_conditions)
-
-    # Query eligible buyers
-    sql = f"""
-    SELECT DISTINCT
-      bo.buyer_id,
-      bo.routing_priority,
-      bo.price_per_lead,
-      bo.capacity_per_day,
-      bo.capacity_per_hour
-    FROM buyer_offers bo
-    JOIN buyers b ON b.id = bo.buyer_id
-    JOIN buyer_service_areas bsa ON bsa.buyer_id = bo.buyer_id
-    WHERE bo.offer_id = :offer_id
-      AND bo.is_active = true
-      AND b.is_active = true
-      AND bsa.market_id = :market_id
-      AND bsa.is_active = true
-      AND ({service_area_match})
-      AND (bo.pause_until IS NULL OR bo.pause_until < CURRENT_TIMESTAMP)
-      AND (b.min_balance_required IS NULL OR b.balance >= b.min_balance_required)
-    ORDER BY bo.routing_priority ASC, bo.buyer_id ASC
-    """
-
-    rows = await session.execute(text(sql), service_area_params)
-    eligible = []
-    for rec in rows.mappings():
-        # Check capacity constraints (simplified - would need daily/hourly tracking in real system)
-        # For now, we skip capacity checks as they require additional tracking tables
-        eligible.append(
-            EligibleBuyer(
-                buyer_id=int(rec["buyer_id"]),
-                routing_priority=int(rec["routing_priority"]),
-                price_per_lead=float(rec["price_per_lead"]) if rec["price_per_lead"] else None,
-                capacity_per_day=int(rec["capacity_per_day"]) if rec["capacity_per_day"] else None,
-                capacity_per_hour=int(rec["capacity_per_hour"]) if rec["capacity_per_hour"] else None,
-            )
-        )
-
-    return eligible
-
-
-def select_buyer_by_strategy(
-    *,
-    eligible_buyers: List[EligibleBuyer],
-    policy_config: Dict[str, Any],
-) -> Optional[EligibleBuyer]:
-    """
-    Select buyer using routing strategy from policy config.
-    Strategies: priority, rotation, weighted
-    """
-    if not eligible_buyers:
-        return None
-
-    strategy = policy_config.get("strategy", "priority")
-    fallback_behavior = policy_config.get("exclusivity_fallback", "fail_closed")
-
-    if strategy == "priority":
-        # Select buyer with highest priority (lowest routing_priority number)
-        # Tie-break by buyer_id (deterministic)
-        return min(eligible_buyers, key=lambda b: (b.routing_priority, b.buyer_id))
-
-    elif strategy == "rotation":
-        # Rotation requires tracking last assigned buyer per offer
-        # For now, use priority as fallback
-        # In production, would query rotation_state table
-        return min(eligible_buyers, key=lambda b: (b.routing_priority, b.buyer_id))
-
-    elif strategy == "weighted":
-        # Weighted selection based on weights in config
-        # For now, use priority as fallback
-        weights = policy_config.get("weights", {})
-        if weights:
-            # Would implement weighted random selection here
-            # For now, fallback to priority
-            pass
-        return min(eligible_buyers, key=lambda b: (b.routing_priority, b.buyer_id))
-
-    else:
-        # Unknown strategy, default to priority
-        return min(eligible_buyers, key=lambda b: (b.routing_priority, b.buyer_id))
-
-
-async def execute_routing(
-    *,
-    session: AsyncSession,
-    lead_id: int,
-) -> RoutingResult:
-    """
-    Execute routing pipeline for a lead:
-    1. Load routing policy
-    2. Check for exclusive buyer
-    3. Get eligible buyers
-    4. Select buyer by strategy
-    5. Update lead status (guarded)
-    """
-    # Load lead data
-    lead_row = await session.execute(
-        text(
-            """
-            SELECT
-              id,
-              offer_id,
-              market_id,
-              status,
-              postal_code,
-              city
-            FROM leads
-            WHERE id = :lead_id
-            """
-        ),
-        {"lead_id": lead_id},
-    )
-    lead_rec = lead_row.mappings().first()
-    if not lead_rec:
-        raise RoutingError(
-            code="lead_not_found",
-            message=f"Lead with id={lead_id} not found",
-        )
-
-    if lead_rec["status"] != "validated":
-        # Already processed or not ready, return current state
-        buyer_id = lead_rec.get("buyer_id")
-        return RoutingResult(
-            buyer_id=int(buyer_id) if buyer_id else None,
-            no_route_reason="lead_not_validated" if lead_rec["status"] != "delivered" else None,
-        )
-
-    offer_id = int(lead_rec["offer_id"])
-    market_id = int(lead_rec["market_id"])
-    postal_code = lead_rec.get("postal_code")
-    city = lead_rec.get("city")
-
-    # Load routing policy
-    policy = await load_routing_policy(session=session, offer_id=offer_id)
-    policy_config = policy.config
-
-    # Step 1: Check for exclusive buyer
-    exclusive_buyer_id = None
-    if postal_code:
-        exclusive_buyer_id = await get_exclusive_buyer(
-            session=session,
-            offer_id=offer_id,
-            scope_type="postal_code",
-            scope_value=postal_code,
-        )
-    if not exclusive_buyer_id and city:
-        exclusive_buyer_id = await get_exclusive_buyer(
-            session=session,
-            offer_id=offer_id,
-            scope_type="city",
-            scope_value=city,
-        )
-
-    if exclusive_buyer_id:
-        # Check if exclusive buyer is eligible
-        eligible = await get_eligible_buyers(
-            session=session,
-            offer_id=offer_id,
-            market_id=market_id,
-            postal_code=postal_code,
-            city=city,
-        )
-        exclusive_eligible = [b for b in eligible if b.buyer_id == exclusive_buyer_id]
-        if exclusive_eligible:
-            # Route to exclusive buyer
-            selected_buyer = exclusive_eligible[0]
-        else:
-            # Exclusive buyer is ineligible
-            fallback_behavior = policy_config.get("exclusivity_fallback", "fail_closed")
-            if fallback_behavior == "fail_closed":
+class RoutingEngine:
+    def __init__(self, redis_client: Optional[Redis] = None, cache_ttl: int = 300):
+        self.redis = redis_client
+        self.cache_ttl = cache_ttl
+        self._strategy_handlers = {
+            RoutingStrategy.PRIORITY: self._priority_strategy,
+            RoutingStrategy.ROUND_ROBIN: self._round_robin_strategy,
+            RoutingStrategy.CAPACITY_WEIGHTED: self._capacity_weighted_strategy,
+            RoutingStrategy.EXCLUSIVE: self._exclusive_strategy,
+        }
+    
+    async def route_lead(self, session: AsyncSession, lead_id: int) -> RoutingResult:
+        start_time = datetime.now()
+        execution_id = str(uuid4())
+        
+        try:
+            logger.info("routing.start", 
+                       lead_id=lead_id, 
+                       execution_id=execution_id)
+            
+            # Load lead with lock to prevent concurrent routing
+            lead = await self._get_lead_for_routing(session, lead_id)
+            
+            if lead.status != "validated":
                 return RoutingResult(
-                    buyer_id=None,
-                    no_route_reason="exclusive_buyer_ineligible_fail_closed",
+                    buyer_id=lead.buyer_id,
+                    price=lead.price,
+                    routing_policy_id=0,
+                    strategy_used=RoutingStrategy.PRIORITY,
+                    execution_time_ms=(datetime.now() - start_time).total_seconds() * 1000,
+                    no_route_reason=f"Lead not validated: {lead.status}"
                 )
-            # fallback_allowed: continue to regular selection
-            selected_buyer = None
-    else:
-        selected_buyer = None
-
-    # Step 2: If no exclusive buyer selected, get eligible buyers and select by strategy
-    if not selected_buyer:
-        eligible = await get_eligible_buyers(
-            session=session,
-            offer_id=offer_id,
-            market_id=market_id,
-            postal_code=postal_code,
-            city=city,
-        )
-
-        if not eligible:
-            return RoutingResult(
-                buyer_id=None,
-                no_route_reason="no_eligible_buyers",
+            
+            # Check cache for recent routing decision
+            cache_key = f"routing:{lead.offer_id}:{lead.postal_code}:{hashlib.md5(lead.email.encode()).hexdigest()[:8]}"
+            cached_result = await self._get_cached_routing(cache_key)
+            
+            if cached_result:
+                logger.info("routing.cache_hit", 
+                           lead_id=lead_id, 
+                           cache_key=cache_key)
+                return RoutingResult(**cached_result, cache_hit=True)
+            
+            # Load routing policy
+            policy = await self._load_routing_policy(session, lead.offer_id)
+            
+            # Check exclusivity first
+            exclusive_buyer = await self._check_exclusivity(
+                session, lead.offer_id, lead.postal_code, lead.city
             )
-
-        selected_buyer = select_buyer_by_strategy(
-            eligible_buyers=eligible,
-            policy_config=policy_config,
-        )
-
-        if not selected_buyer:
-            return RoutingResult(
-                buyer_id=None,
-                no_route_reason="strategy_selection_failed",
+            
+            if exclusive_buyer:
+                strategy = RoutingStrategy.EXCLUSIVE
+                selected_buyer = exclusive_buyer
+                price = await self._get_buyer_price(session, lead.offer_id, exclusive_buyer)
+            else:
+                # Get eligible buyers
+                eligible = await self._get_eligible_buyers(
+                    session, lead.offer_id, lead.market_id, 
+                    lead.postal_code, lead.city
+                )
+                
+                if not eligible:
+                    return RoutingResult(
+                        buyer_id=None,
+                        price=None,
+                        routing_policy_id=policy.id,
+                        strategy_used=policy.strategy,
+                        execution_time_ms=(datetime.now() - start_time).total_seconds() * 1000,
+                        no_route_reason="no_eligible_buyers"
+                    )
+                
+                # Apply strategy
+                handler = self._strategy_handlers.get(policy.strategy, self._priority_strategy)
+                selected_buyer = await handler(eligible, policy.config)
+                
+                if not selected_buyer and policy.fallback_strategy:
+                    fallback_handler = self._strategy_handlers.get(policy.fallback_strategy)
+                    selected_buyer = await fallback_handler(eligible, policy.config)
+                
+                price = await self._get_buyer_price(session, lead.offer_id, selected_buyer)
+                strategy = policy.strategy
+            
+            # Update lead with routing decision (guarded)
+            updated = await self._update_lead_routing(
+                session, lead_id, selected_buyer, price
             )
-
-    # Step 3: Update lead with buyer_id (guarded transition)
-    # Note: Status remains 'validated' until delivery succeeds
-    update_result = await session.execute(
-        text(
-            """
-            UPDATE leads
-            SET
-              buyer_id = :buyer_id,
-              updated_at = CURRENT_TIMESTAMP
-            WHERE id = :lead_id
-              AND status = 'validated'
+            
+            if not updated:
+                logger.warning("routing.concurrent_update",
+                             lead_id=lead_id,
+                             execution_id=execution_id)
+                # Get current state
+                current = await self._get_lead_for_routing(session, lead_id)
+                return RoutingResult(
+                    buyer_id=current.buyer_id,
+                    price=current.price,
+                    routing_policy_id=policy.id,
+                    strategy_used=strategy,
+                    execution_time_ms=(datetime.now() - start_time).total_seconds() * 1000,
+                    warnings=["concurrent_routing_detected"]
+                )
+            
+            result = RoutingResult(
+                buyer_id=selected_buyer,
+                price=price,
+                routing_policy_id=policy.id,
+                strategy_used=strategy,
+                execution_time_ms=(datetime.now() - start_time).total_seconds() * 1000
+            )
+            
+            # Cache result
+            await self._cache_routing(cache_key, result)
+            
+            logger.info("routing.complete",
+                       lead_id=lead_id,
+                       buyer_id=selected_buyer,
+                       price=price,
+                       strategy=strategy.value,
+                       execution_ms=result.execution_time_ms)
+            
+            return result
+            
+        except Exception as e:
+            logger.error("routing.error",
+                        lead_id=lead_id,
+                        execution_id=execution_id,
+                        error=str(e),
+                        traceback=True)
+            raise RoutingError(
+                code="routing_engine_failure",
+                message=f"Routing failed for lead {lead_id}: {str(e)}",
+                details={"execution_id": execution_id}
+            )
+    
+    async def _get_lead_for_routing(self, session: AsyncSession, lead_id: int):
+        """Load lead with FOR UPDATE SKIP LOCKED for concurrency control."""
+        query = text("""
+            SELECT 
+                l.id, l.offer_id, l.market_id, l.status, l.postal_code, l.city,
+                l.email, l.buyer_id, l.price,
+                o.routing_policy_id
+            FROM leads l
+            JOIN offers o ON o.id = l.offer_id
+            WHERE l.id = :lead_id
+            FOR UPDATE SKIP LOCKED
+        """)
+        
+        result = await session.execute(query, {"lead_id": lead_id})
+        row = result.mappings().first()
+        
+        if not row:
+            raise RoutingError(
+                code="lead_not_found",
+                message=f"Lead {lead_id} not found or locked"
+            )
+        
+        return row
+    
+    async def _load_routing_policy(self, session: AsyncSession, offer_id: int) -> RoutingPolicy:
+        query = text("""
+            SELECT 
+                rp.id, rp.name, rp.version, rp.config, rp.is_active
+            FROM routing_policies rp
+            JOIN offers o ON o.routing_policy_id = rp.id
+            WHERE o.id = :offer_id AND rp.is_active = TRUE
+        """)
+        
+        result = await session.execute(query, {"offer_id": offer_id})
+        row = result.mappings().first()
+        
+        if not row:
+            raise RoutingError(
+                code="routing_policy_not_found",
+                message=f"No active routing policy for offer {offer_id}"
+            )
+        
+        config = row.config
+        strategy_str = config.get("strategy", "priority")
+        
+        try:
+            strategy = RoutingStrategy(strategy_str)
+        except ValueError:
+            strategy = RoutingStrategy.PRIORITY
+        
+        fallback = None
+        if config.get("fallback_strategy"):
+            try:
+                fallback = RoutingStrategy(config["fallback_strategy"])
+            except ValueError:
+                pass
+        
+        return RoutingPolicy(
+            id=row.id,
+            name=row.name,
+            version=row.version,
+            strategy=strategy,
+            config=config,
+            fallback_strategy=fallback,
+            is_active=row.is_active
+        )
+    
+    async def _check_exclusivity(self, session: AsyncSession, offer_id: int, 
+                                postal_code: str, city: Optional[str]) -> Optional[int]:
+        conditions = []
+        params = {"offer_id": offer_id}
+        
+        if postal_code:
+            conditions.append("(scope_type = 'postal_code' AND scope_value = :postal_code)")
+            params["postal_code"] = postal_code
+        
+        if city:
+            conditions.append("(scope_type = 'city' AND scope_value = :city)")
+            params["city"] = city
+        
+        if not conditions:
+            return None
+        
+        where_clause = " OR ".join(conditions)
+        
+        query = text(f"""
+            SELECT buyer_id 
+            FROM offer_exclusivities 
+            WHERE offer_id = :offer_id 
+            AND is_active = TRUE 
+            AND ({where_clause})
+            LIMIT 1
+        """)
+        
+        result = await session.execute(query, params)
+        row = result.mappings().first()
+        
+        return row.buyer_id if row else None
+    
+    async def _get_eligible_buyers(self, session: AsyncSession, offer_id: int, 
+                                  market_id: int, postal_code: str, 
+                                  city: Optional[str]) -> List[EligibleBuyer]:
+        # Complex query with service area matching and capacity checks
+        query = text("""
+            WITH eligible_base AS (
+                SELECT 
+                    bo.buyer_id,
+                    bo.routing_priority,
+                    COALESCE(bo.price_per_lead, o.default_price_per_lead) as price_per_lead,
+                    bo.capacity_per_day,
+                    bo.capacity_per_hour,
+                    b.min_balance_required,
+                    b.balance,
+                    bo.pause_until,
+                    bo.last_assigned
+                FROM buyer_offers bo
+                JOIN offers o ON o.id = bo.offer_id
+                JOIN buyers b ON b.id = bo.buyer_id
+                WHERE bo.offer_id = :offer_id
+                AND bo.is_active = TRUE
+                AND b.is_active = TRUE
+                AND (bo.pause_until IS NULL OR bo.pause_until < NOW())
+                AND (b.min_balance_required IS NULL OR b.balance >= b.min_balance_required)
+            ),
+            service_area_match AS (
+                SELECT DISTINCT buyer_id
+                FROM buyer_service_areas
+                WHERE market_id = :market_id
+                AND is_active = TRUE
+                AND (
+                    (scope_type = 'postal_code' AND scope_value = :postal_code)
+                    OR
+                    (scope_type = 'city' AND scope_value = :city)
+                    OR
+                    (scope_type = 'postal_code' AND scope_value LIKE SUBSTRING(:postal_code FROM 1 FOR 3) || '%')
+                )
+            ),
+            capacity_check AS (
+                SELECT 
+                    eb.*,
+                    COALESCE(dc.lead_count, 0) as daily_count,
+                    COALESCE(hc.lead_count, 0) as hourly_count
+                FROM eligible_base eb
+                LEFT JOIN (
+                    SELECT buyer_id, COUNT(*) as lead_count
+                    FROM leads
+                    WHERE offer_id = :offer_id
+                    AND buyer_id IS NOT NULL
+                    AND delivered_at >= NOW() - INTERVAL '24 HOURS'
+                    GROUP BY buyer_id
+                ) dc ON dc.buyer_id = eb.buyer_id
+                LEFT JOIN (
+                    SELECT buyer_id, COUNT(*) as lead_count
+                    FROM leads
+                    WHERE offer_id = :offer_id
+                    AND buyer_id IS NOT NULL
+                    AND delivered_at >= NOW() - INTERVAL '1 HOUR'
+                    GROUP BY buyer_id
+                ) hc ON hc.buyer_id = eb.buyer_id
+                WHERE (eb.capacity_per_day IS NULL OR COALESCE(dc.lead_count, 0) < eb.capacity_per_day)
+                AND (eb.capacity_per_hour IS NULL OR COALESCE(hc.lead_count, 0) < eb.capacity_per_hour)
+            )
+            SELECT cc.*, sam.buyer_id as service_approved
+            FROM capacity_check cc
+            INNER JOIN service_area_match sam ON sam.buyer_id = cc.buyer_id
+            ORDER BY cc.routing_priority ASC, cc.last_assigned ASC NULLS FIRST
+        """)
+        
+        result = await session.execute(query, {
+            "offer_id": offer_id,
+            "market_id": market_id,
+            "postal_code": postal_code,
+            "city": city or ""
+        })
+        
+        buyers = []
+        for row in result.mappings():
+            capacity = BuyerCapacity(
+                daily_used=row.daily_count,
+                daily_limit=row.capacity_per_day,
+                hourly_used=row.hourly_count,
+                hourly_limit=row.capacity_per_hour,
+                is_capped=(
+                    (row.capacity_per_day is not None and row.daily_count >= row.capacity_per_day) or
+                    (row.capacity_per_hour is not None and row.hourly_count >= row.capacity_per_hour)
+                )
+            )
+            
+            buyers.append(EligibleBuyer(
+                buyer_id=row.buyer_id,
+                routing_priority=row.routing_priority,
+                price_per_lead=float(row.price_per_lead),
+                capacity=capacity,
+                last_assigned=row.last_assigned
+            ))
+        
+        return buyers
+    
+    async def _priority_strategy(self, buyers: List[EligibleBuyer], config: Dict) -> Optional[int]:
+        if not buyers:
+            return None
+        
+        # Sort by priority, then by least recently assigned
+        sorted_buyers = sorted(buyers, key=lambda b: (
+            b.capacity.is_capped,  # Uncapped first
+            b.routing_priority,
+            1 if b.last_assigned else 0,  # Never assigned first
+            b.last_assigned or datetime.min
+        ))
+        
+        return sorted_buyers[0].buyer_id
+    
+    async def _round_robin_strategy(self, buyers: List[EligibleBuyer], config: Dict) -> Optional[int]:
+        if not buyers:
+            return None
+        
+        # Filter out capped buyers
+        available = [b for b in buyers if not b.capacity.is_capped]
+        
+        if not available:
+            return None
+        
+        # Sort by last assigned (NULLs first), then by priority
+        sorted_buyers = sorted(available, key=lambda b: (
+            1 if b.last_assigned else 0,
+            b.last_assigned or datetime.min,
+            b.routing_priority
+        ))
+        
+        return sorted_buyers[0].buyer_id
+    
+    async def _capacity_weighted_strategy(self, buyers: List[EligibleBuyer], config: Dict) -> Optional[int]:
+        if not buyers:
+            return None
+        
+        available = [b for b in buyers if not b.capacity.is_capped]
+        
+        if not available:
+            return None
+        
+        # Calculate weights based on remaining capacity
+        weighted_buyers = []
+        for buyer in available:
+            if buyer.capacity.daily_limit:
+                remaining = max(0, buyer.capacity.daily_limit - buyer.capacity.daily_used)
+                weight = remaining / buyer.capacity.daily_limit
+            else:
+                weight = 1.0
+            
+            weighted_buyers.append((buyer, weight))
+        
+        # Sort by weight (descending), then priority
+        sorted_buyers = sorted(weighted_buyers, key=lambda x: (-x[1], x[0].routing_priority))
+        
+        return sorted_buyers[0][0].buyer_id if sorted_buyers else None
+    
+    async def _exclusive_strategy(self, buyers: List[EligibleBuyer], config: Dict) -> Optional[int]:
+        # Exclusive strategy only used when exclusivity is detected
+        # This handler shouldn't be called directly
+        return None
+    
+    async def _get_buyer_price(self, session: AsyncSession, offer_id: int, buyer_id: int) -> float:
+        query = text("""
+            SELECT COALESCE(bo.price_per_lead, o.default_price_per_lead) as price
+            FROM buyer_offers bo
+            JOIN offers o ON o.id = bo.offer_id
+            WHERE bo.offer_id = :offer_id 
+            AND bo.buyer_id = :buyer_id
+            AND bo.is_active = TRUE
+        """)
+        
+        result = await session.execute(query, {"offer_id": offer_id, "buyer_id": buyer_id})
+        row = result.mappings().first()
+        
+        if not row:
+            raise RoutingError(
+                code="buyer_price_not_found",
+                message=f"Price not found for buyer {buyer_id} on offer {offer_id}"
+            )
+        
+        return float(row.price)
+    
+    async def _update_lead_routing(self, session: AsyncSession, lead_id: int, 
+                                  buyer_id: int, price: float) -> bool:
+        query = text("""
+            UPDATE leads 
+            SET 
+                buyer_id = :buyer_id,
+                price = :price,
+                updated_at = NOW(),
+                routing_attempts = COALESCE(routing_attempts, 0) + 1
+            WHERE id = :lead_id 
+            AND status = 'validated'
             RETURNING id
-            """
-        ),
-        {
+        """)
+        
+        result = await session.execute(query, {
             "lead_id": lead_id,
-            "buyer_id": selected_buyer.buyer_id,
-        },
-    )
-    updated_rec = update_result.mappings().first()
-
-    if not updated_rec:
-        # Concurrent routing attempt or status changed
-        # Fetch current state
-        current_row = await session.execute(
-            text("SELECT buyer_id, status FROM leads WHERE id = :lead_id"),
-            {"lead_id": lead_id},
-        )
-        current_rec = current_row.mappings().first()
-        if current_rec and current_rec["status"] == "delivered":
-            return RoutingResult(
-                buyer_id=int(current_rec["buyer_id"]) if current_rec["buyer_id"] else None,
+            "buyer_id": buyer_id,
+            "price": price
+        })
+        
+        return result.rowcount > 0
+    
+    async def _get_cached_routing(self, cache_key: str) -> Optional[Dict]:
+        if not self.redis:
+            return None
+        
+        try:
+            cached = await self.redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            logger.warning("routing.cache_read_failed", key=cache_key)
+        
+        return None
+    
+    async def _cache_routing(self, cache_key: str, result: RoutingResult):
+        if not self.redis:
+            return
+        
+        try:
+            cache_data = {
+                "buyer_id": result.buyer_id,
+                "price": result.price,
+                "routing_policy_id": result.routing_policy_id,
+                "strategy_used": result.strategy_used.value,
+                "execution_time_ms": result.execution_time_ms
+            }
+            
+            await self.redis.setex(
+                cache_key,
+                self.cache_ttl,
+                json.dumps(cache_data)
             )
-        return RoutingResult(
-            buyer_id=None,
-            no_route_reason="concurrent_routing_attempt",
-        )
+        except Exception:
+            logger.warning("routing.cache_write_failed", key=cache_key)
 
-    await session.commit()
-
-    # Note: Delivery enqueue should be triggered separately after routing completes
-    # In production, would push to Redis queue via background task
-    # For now, delivery can be triggered via worker or separate API call
-
-    return RoutingResult(
-        buyer_id=selected_buyer.buyer_id,
-    )
-
+# Global instance
+routing_engine = RoutingEngine()
